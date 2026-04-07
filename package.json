@@ -1,0 +1,12 @@
+{
+  "name": "geomagic-claude",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scan-to-CAD reverse engineering application",
+  "scripts": {
+    "dev": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "install:frontend": "cd frontend && npm install",
+    "install:backend": "pip install -r backend/requirements.txt"
+  }
+}
