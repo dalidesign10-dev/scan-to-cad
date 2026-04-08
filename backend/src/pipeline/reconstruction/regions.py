@@ -35,11 +35,31 @@ SOFT_GATE_NORMAL_DEG = 18.0      # max angle to running region normal
 
 # Fit-driven grower tunables. These are bbox-diagonal relative so the same
 # numbers work on a 10mm boss and a 500mm bracket.
-FIT_SEED_MIN_FACES = 24          # BFS from seed until >= this many faces
+FIT_SEED_MIN_FACES = 24          # BFS from seed until >= this many faces (plane pass)
+FIT_CYL_SEED_MIN_FACES = 12      # smaller seed for cylinder pass — small holes need to fit
 FIT_PLANE_TOL_REL = 0.008        # max |signed distance| / bbox for plane grow
 FIT_CYL_TOL_REL = 0.012          # max |radial residual| / bbox for cylinder grow
 FIT_PLANE_NORMAL_DEG = 18.0      # face-normal deviation from plane normal
 FIT_CYL_AXIS_PERP_DEG = 15.0     # face-normal may be this far from perpendicular-to-axis
+
+# Cylinder-seed signature. The cheap SVD on the seed neighborhood's normals
+# decides whether it's worth trying a forced cylinder fit. A cylinder surface
+# has normals that lie IN a plane (sv[2] small) but actually SPAN that plane
+# (sv[1] non-trivial). A flat plane has sv[1] ≈ 0 (all normals parallel) and
+# gets filtered cheaply before we burn a full cylinder fit on it.
+#
+# These thresholds are deliberately strict. The cylinder pass can only HURT
+# the segmentation by claiming territory that belongs to a plane and then
+# growing across the plane via a loose tolerance. So we'd rather miss some
+# cylinders than false-positive: the plane pass that runs after still
+# segments the surface, just without the cylinder annotation.
+CYL_SEED_SV2_MAX = 0.10          # sv[2]/sv[0] — normals planar enough
+CYL_SEED_SV1_MIN = 0.20          # sv[1]/sv[0] — span the plane (not all parallel)
+# Absolute radius cap relative to the WHOLE mesh bbox (not the seed
+# neighborhood). A real cylindrical feature on a mechanical part is at most
+# half the part's bbox; anything bigger is a noisy plane being modeled as a
+# huge-radius cylinder.
+CYL_SEED_MAX_RADIUS_FRAC_OF_MESH = 0.50
 
 
 def grow_regions(
@@ -151,11 +171,23 @@ def grow_regions_fit_driven(
 ) -> np.ndarray:
     """Primitive-driven region growing.
 
-    For each unassigned seed (largest-area first), build a small BFS
-    neighborhood, fit a plane or cylinder to it, then grow outward while
-    candidate faces stay inside the current primitive's residual and
-    normal-alignment tolerances. When the fit can no longer absorb new
-    faces, close this region and pick the next seed.
+    For each unassigned seed, build a small BFS neighborhood, fit a plane
+    or cylinder to it, then grow outward while candidate faces stay
+    inside the current primitive's residual and normal-alignment
+    tolerances. When the fit can no longer absorb new faces, close this
+    region and pick the next seed.
+
+    Two passes:
+      1. Cylinder-seed-first scan. Walks unlabeled faces, tests each
+         seed neighborhood against a cheap cylinder signature (normal
+         SVD pattern: planar but spanning). Candidates that pass are
+         forced through the cylinder fitter; HIGH/MEDIUM cylinder fits
+         seed a region and grow. This runs first so plane growth can't
+         swallow tight cylindrical features before their own seed turn.
+      2. Plane-dominant pass. Area-ordered, auto-pick primitive. On
+         clean CAD this is where most planes come from. On the leftover
+         from pass 1, it picks up the flat faces around already-labeled
+         cylinders.
 
     Key difference from the dihedral grower: the boundary between regions
     is whatever line the primitive fit refuses to cross. We never need
@@ -177,11 +209,31 @@ def grow_regions_fit_driven(
     sin_cyl_perp = float(np.sin(np.radians(FIT_CYL_AXIS_PERP_DEG)))
 
     if progress_callback:
-        progress_callback("intent.regions", 5, "Fit-driven region growing...")
+        progress_callback("intent.regions", 5, "Fit-driven: cylinder seed pass...")
 
-    # Seeds: largest faces first. The first seed on a big flat surface
-    # starts from a neighborhood that will fit a high-confidence plane
-    # immediately; subsequent seeds fall onto whatever's left.
+    # Pass 1: cylinder-seed-first scan.
+    cur_label = _cylinder_seed_pass(
+        proxy,
+        signals,
+        labels,
+        cur_label,
+        mesh_bbox_diag=bbox_diag,
+        plane_tol=plane_tol,
+        cyl_tol=cyl_tol,
+        cos_plane_normal=cos_plane_normal,
+        sin_cyl_perp=sin_cyl_perp,
+    )
+
+    if progress_callback:
+        progress_callback(
+            "intent.regions",
+            30,
+            f"Cylinder pass: {cur_label} regions; starting plane-dominant pass...",
+        )
+
+    # Pass 2: original area-ordered plane-dominant loop. Seeds: largest
+    # faces first. Already-labeled cylinder faces from pass 1 are
+    # skipped by the labels[seed] >= 0 check.
     order = np.argsort(-proxy.face_areas)
 
     for seed in order:
@@ -276,6 +328,172 @@ def grow_regions_fit_driven(
         progress_callback("intent.regions", 100, f"Final regions: {int(labels.max()) + 1}")
 
     return labels
+
+
+def _cylinder_seed_pass(
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    labels: np.ndarray,
+    cur_label: int,
+    mesh_bbox_diag: float,
+    plane_tol: float,
+    cyl_tol: float,
+    cos_plane_normal: float,
+    sin_cyl_perp: float,
+) -> int:
+    """Walk unlabeled faces, seed any neighborhood that looks like a
+    cylindrical patch, force a cylinder fit, and grow it if the fit
+    grades HIGH or MEDIUM.
+
+    The seed order is area-descending — same as the plane pass — but
+    most plane-like seeds are filtered out cheaply by the normal-SVD
+    signature before we ever call `fit_region`. What survives the
+    signature filter and passes a forced cylinder fit gets a region.
+    Anything that fails is left alone for the plane-dominant pass that
+    runs after this one.
+
+    Mutates `labels` in place. Returns the new cur_label.
+    """
+    order = np.argsort(-proxy.face_areas)
+
+    for seed in order:
+        seed = int(seed)
+        if labels[seed] >= 0:
+            continue
+
+        seed_faces = _seed_neighborhood(seed, labels, signals.face_adj, FIT_CYL_SEED_MIN_FACES)
+        if len(seed_faces) < 8:
+            continue  # too small to identify a cylinder; plane pass will handle
+
+        seed_idx = np.asarray(seed_faces, dtype=np.int64)
+        seed_normals = proxy.face_normals[seed_idx]
+
+        # Cheap cylinder signature: normals must lie on a great circle.
+        # Center the normal cloud and SVD it. Cylinder → sv[2] near zero
+        # (normals are planar) AND sv[1] not tiny (they span the plane).
+        nc = seed_normals - seed_normals.mean(axis=0)
+        try:
+            _, sv, _ = np.linalg.svd(nc, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        if sv[0] < 1e-9:
+            continue
+        sv2_ratio = float(sv[2] / sv[0])
+        sv1_ratio = float(sv[1] / sv[0])
+        if sv2_ratio > CYL_SEED_SV2_MAX:
+            continue  # normals not planar enough — likely a curved freeform patch
+        if sv1_ratio < CYL_SEED_SV1_MIN:
+            continue  # normals all parallel — this is a plane, skip
+
+        # Passed the signature. Try a forced cylinder fit.
+        vert_idx = np.unique(proxy.faces[seed_idx].flatten())
+        pts = proxy.vertices[vert_idx]
+        fit = fit_region(
+            pts,
+            seed_normals,
+            fit_source="cyl_seed",
+            forced_type=PrimitiveType.CYLINDER,
+        )
+        if fit.type != PrimitiveType.CYLINDER:
+            continue
+        # Accept HIGH and MEDIUM. The strict gate is the radius cap below
+        # — that's what filters out noisy planes interpreted as huge-radius
+        # cylinders, not the confidence class.
+        if fit.confidence_class not in (ConfidenceClass.HIGH, ConfidenceClass.MEDIUM):
+            continue
+        # Absolute radius cap relative to the WHOLE mesh. A real mechanical
+        # cylinder is at most ~half the part's bbox; a 5x-bbox-radius
+        # cylinder is just a slightly-curved noisy plane and growing one
+        # would eat into adjacent plane regions on the next pass.
+        radius = float(fit.params.get("radius", 0.0))
+        if radius > mesh_bbox_diag * CYL_SEED_MAX_RADIUS_FRAC_OF_MESH:
+            continue
+
+        # Seed the region with the entire seed neighborhood, then BFS
+        # outward using the same residual/normal gate as the main grower.
+        # We use a TENTATIVE label here — the grown region only commits if
+        # the final refit grades HIGH. Noisy MEDIUM cylinder seeds are
+        # exactly how the cylinder pass used to eat plane area on scans.
+        tentative = cur_label
+        for f in seed_faces:
+            if labels[f] < 0:
+                labels[f] = tentative
+
+        q: deque = deque()
+        for f in seed_faces:
+            for nb, _ei in signals.face_adj[f]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+        region_face_count = int((labels == tentative).sum())
+        next_refit = max(2 * region_face_count, 60)
+
+        while q:
+            fi = q.popleft()
+            if labels[fi] >= 0:
+                continue
+            if not _face_passes_fit(
+                fi,
+                fit,
+                proxy,
+                plane_tol=plane_tol,
+                cyl_tol=cyl_tol,
+                cos_plane_normal=cos_plane_normal,
+                sin_cyl_perp=sin_cyl_perp,
+            ):
+                continue
+            labels[fi] = tentative
+            region_face_count += 1
+            for nb, _ei in signals.face_adj[fi]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+            if region_face_count >= next_refit:
+                region_idx = np.where(labels == tentative)[0].astype(np.int64)
+                r_verts = np.unique(proxy.faces[region_idx].flatten())
+                refit = fit_region(
+                    proxy.vertices[r_verts],
+                    proxy.face_normals[region_idx],
+                    fit_source="cyl_seed_refit",
+                    forced_type=PrimitiveType.CYLINDER,
+                )
+                if (
+                    refit.type == PrimitiveType.CYLINDER
+                    and refit.confidence_class != ConfidenceClass.REJECTED
+                ):
+                    fit = refit
+                next_refit = int(region_face_count * 2)
+
+        # Final validation refit on the entire grown region. If the cylinder
+        # didn't actually crystallize at HIGH confidence, release the labels
+        # back to -1 so the plane pass can reclaim the territory. This is
+        # what stops noisy MED seeds from polluting the segmentation.
+        region_mask = labels == tentative
+        n_region = int(region_mask.sum())
+        keep = False
+        if n_region >= 12:
+            region_idx = np.where(region_mask)[0].astype(np.int64)
+            r_verts = np.unique(proxy.faces[region_idx].flatten())
+            final = fit_region(
+                proxy.vertices[r_verts],
+                proxy.face_normals[region_idx],
+                fit_source="cyl_seed_final",
+                forced_type=PrimitiveType.CYLINDER,
+            )
+            if (
+                final.type == PrimitiveType.CYLINDER
+                and final.confidence_class == ConfidenceClass.HIGH
+                and float(final.params.get("radius", 0.0))
+                    <= mesh_bbox_diag * CYL_SEED_MAX_RADIUS_FRAC_OF_MESH
+            ):
+                keep = True
+
+        if keep:
+            cur_label += 1
+        else:
+            labels[region_mask] = -1
+
+    return cur_label
 
 
 def _seed_neighborhood(

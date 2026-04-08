@@ -380,16 +380,20 @@ def test_scanned11_fit_driven_segments_primitives():
     so we don't need dihedral edges to form closed loops — which they
     don't on a noisy scan.
 
+    Two passes inside the fit-driven grower:
+      1. Cylinder-seed-first scan with a tight signature filter and
+         validate-after-grow (only HIGH cylinder regions are kept; the
+         rest are released back so the plane pass can claim them).
+      2. Plane-dominant area-ordered loop on whatever's left.
+
     This is the concrete fix for the mega-region failure mode. On
     scanned11 the dihedral grower produces ~2% area explained in HIGH
     fits with a 94% mega-region. The fit-driven grower produces >=40%
-    area explained in HIGH fits, no mega-region, and >=10 HIGH planes.
+    area explained in HIGH fits, no mega-region, >=10 HIGH planes,
+    AND >=2 HIGH cylinders (the cylinder pass recovers them).
 
-    Known limitation (intentional): the fit-driven grower currently
-    seeds by face area, so large flat surfaces absorb before tight
-    cylinder patches get a chance. Scanned11 produces many HIGH planes
-    but few HIGH cylinders here. A cylinder-first seeding pass is the
-    next step; it doesn't belong in this test.
+    Observed at this commit: ~29 HIGH planes, 2 HIGH cylinders, ~52%
+    area, max region ~17%.
     """
     scan_path = os.path.join(HERE, "fixtures_local", "scanned11.stl")
     if not os.path.isfile(scan_path):
@@ -403,24 +407,37 @@ def test_scanned11_fit_driven_segments_primitives():
         growth_mode="fit_driven",
     )
     s = state.summary()
-    n_high = s["n_high_plane_fits"] + s["n_high_cylinder_fits"]
+    n_high_plane = s["n_high_plane_fits"]
+    n_high_cyl = s["n_high_cylinder_fits"]
+    n_high = n_high_plane + n_high_cyl
     max_region_frac = max(
         (r.area_fraction for r in state.regions.values()), default=0.0
     )
 
-    # HIGH count: the dihedral baseline finds 2. Fit-driven must dwarf
-    # that. Observed at this commit: ~26 HIGH (all planes).
-    assert n_high >= 10, (
-        f"scanned11 fit_driven: expected >=10 HIGH fits, got {n_high}"
+    # HIGH plane count: the dihedral baseline finds 0. Fit-driven
+    # observed ~29. Floor at 10 to leave headroom for tuning.
+    assert n_high_plane >= 10, (
+        f"scanned11 fit_driven: expected >=10 HIGH planes, got {n_high_plane}"
     )
-    # Area explained by HIGH fits: baseline is ~1%. Fit-driven observed
-    # ~45%. Floor at 25% to leave headroom for tuning.
+    # HIGH cylinder count: the cylinder-seed pass should recover the
+    # cylindrical features that the plane-first loop was swallowing.
+    # Observed: 2. Floor at 2.
+    assert n_high_cyl >= 2, (
+        f"scanned11 fit_driven: expected >=2 HIGH cylinders, got {n_high_cyl} "
+        f"— is the cylinder-seed pass still wired in?"
+    )
+    # Total HIGH fits.
+    assert n_high >= 12, (
+        f"scanned11 fit_driven: expected >=12 HIGH fits, got {n_high}"
+    )
+    # Area explained by HIGH fits: baseline ~1%. Fit-driven observed ~52%.
+    # Floor at 25% to leave headroom for tuning.
     assert s["explained_area_high_pct"] >= 25.0, (
         f"scanned11 fit_driven: only {s['explained_area_high_pct']:.1f}% "
         f"area explained at HIGH confidence"
     )
     # Mega-region must be gone. Baseline is 0.94; fit-driven observed
-    # 0.12. Hard ceiling at 0.40 — larger than that means a major chunk
+    # 0.17. Hard ceiling at 0.40 — larger than that means a major chunk
     # of the scan went unsegmented.
     assert max_region_frac <= 0.40, (
         f"scanned11 fit_driven: largest region still {max_region_frac*100:.1f}% "
