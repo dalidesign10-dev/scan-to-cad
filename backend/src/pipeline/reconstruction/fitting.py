@@ -47,6 +47,7 @@ def fit_region(
     points: np.ndarray,
     normals: Optional[np.ndarray],
     fit_source: str = "proxy",
+    forced_type: Optional[PrimitiveType] = None,
 ) -> PrimitiveFit:
     """Try plane then cylinder; return whichever wins, else UNKNOWN.
 
@@ -54,6 +55,12 @@ def fit_region(
     HIGH gate always wins, even if the cylinder has marginally lower RMSE
     (mechanical bias: planar > cylindrical when ambiguous, because flat
     surfaces dominate molded brackets and a wrong cylinder is uglier).
+
+    `forced_type` is the manual-override escape hatch. When set, the fitter
+    attempts ONLY that primitive and reports it honestly (even LOW), with
+    an "override" note, skipping the type-selection ladder below. That's
+    how a user saying "this region IS a plane, trust me" gets acted on
+    without letting the override endpoint become decorative.
     """
     if points.shape[0] < 8:
         return _unknown(np.array([]), fit_source, "too few points")
@@ -61,6 +68,21 @@ def fit_region(
     bbox_diag = float(np.linalg.norm(np.ptp(points, axis=0)))
     if bbox_diag < 1e-9:
         return _unknown(np.array([]), fit_source, "degenerate bbox")
+
+    if forced_type is not None:
+        if forced_type == PrimitiveType.PLANE:
+            fit = _fit_plane(points, normals, bbox_diag, fit_source)
+            if fit.confidence_class == ConfidenceClass.REJECTED:
+                return _unknown(np.array([]), fit_source, "forced plane rejected")
+            fit.notes = (fit.notes + " | override:force_plane").strip(" |")
+            return fit
+        if forced_type == PrimitiveType.CYLINDER:
+            fit = _fit_cylinder(points, normals, bbox_diag, fit_source)
+            if fit.confidence_class == ConfidenceClass.REJECTED:
+                return _unknown(np.array([]), fit_source, f"forced cylinder rejected: {fit.notes}")
+            fit.notes = (fit.notes + " | override:force_cylinder").strip(" |")
+            return fit
+        # Anything else (UNKNOWN, future types) falls through to auto-pick.
 
     plane = _fit_plane(points, normals, bbox_diag, fit_source)
 
@@ -127,10 +149,17 @@ def _fit_plane(
     rmse = float(np.sqrt(np.mean(residuals ** 2)))
     p95 = float(np.quantile(residuals, 0.95))
 
-    threshold = max(bbox_diag * PLANE_HIGH_RMSE_REL, 1e-9)
-    inliers = float(np.mean(residuals < threshold))
+    # Per-band inlier ratios. Computing a single ratio against the HIGH
+    # threshold and re-using it for the MEDIUM gate (B1 bug in the initial
+    # commit) makes MEDIUM strictly harder than intended — 65% of points
+    # within the HIGH band is not the same as 65% within the MED band.
+    inliers_high = float(np.mean(residuals < max(bbox_diag * PLANE_HIGH_RMSE_REL, 1e-9)))
+    inliers_med = float(np.mean(residuals < max(bbox_diag * PLANE_MED_RMSE_REL, 1e-9)))
 
-    cls = _grade_plane(rmse, inliers, bbox_diag)
+    cls = _grade_plane(rmse, inliers_high, inliers_med, bbox_diag)
+    # Report the inlier ratio that matches the grade we landed on — that's
+    # what downstream UI should display.
+    inliers = inliers_high if cls == ConfidenceClass.HIGH else inliers_med
     score = _plane_score(rmse, inliers, bbox_diag)
     return PrimitiveFit(
         type=PrimitiveType.PLANE,
@@ -214,13 +243,14 @@ def _fit_cylinder(
     rmse = float(np.sqrt(np.mean(residuals ** 2)))
     p95 = float(np.quantile(residuals, 0.95))
 
-    threshold = max(bbox_diag * CYL_HIGH_RMSE_REL, 1e-9)
-    inliers = float(np.mean(residuals < threshold))
+    inliers_high = float(np.mean(residuals < max(bbox_diag * CYL_HIGH_RMSE_REL, 1e-9)))
+    inliers_med = float(np.mean(residuals < max(bbox_diag * CYL_MED_RMSE_REL, 1e-9)))
 
     proj_heights = (diff_c @ axis)
     height = float(proj_heights.max() - proj_heights.min())
 
-    cls = _grade_cylinder(rmse, inliers, bbox_diag)
+    cls = _grade_cylinder(rmse, inliers_high, inliers_med, bbox_diag)
+    inliers = inliers_high if cls == ConfidenceClass.HIGH else inliers_med
     score = _cylinder_score(rmse, inliers, bbox_diag)
     return PrimitiveFit(
         type=PrimitiveType.CYLINDER,
@@ -269,20 +299,37 @@ def _rejected(t: PrimitiveType, fit_source: str, note: str) -> PrimitiveFit:
     )
 
 
-def _grade_plane(rmse: float, inliers: float, bbox_diag: float) -> ConfidenceClass:
+def _grade_plane(
+    rmse: float,
+    inliers_high: float,
+    inliers_med: float,
+    bbox_diag: float,
+) -> ConfidenceClass:
+    """Grade a plane fit using the inlier ratio that matches each band.
+
+    `inliers_high` must be the fraction of points within the HIGH band,
+    `inliers_med` the fraction within the (wider) MED band. Using a single
+    HIGH-band ratio for both gates was B1 in the initial commit — it made
+    MEDIUM strictly harder than MEDIUM should be.
+    """
     rel = rmse / max(bbox_diag, 1e-12)
-    if rel <= PLANE_HIGH_RMSE_REL and inliers >= PLANE_HIGH_INLIER:
+    if rel <= PLANE_HIGH_RMSE_REL and inliers_high >= PLANE_HIGH_INLIER:
         return ConfidenceClass.HIGH
-    if rel <= PLANE_MED_RMSE_REL and inliers >= PLANE_MED_INLIER:
+    if rel <= PLANE_MED_RMSE_REL and inliers_med >= PLANE_MED_INLIER:
         return ConfidenceClass.MEDIUM
     return ConfidenceClass.LOW
 
 
-def _grade_cylinder(rmse: float, inliers: float, bbox_diag: float) -> ConfidenceClass:
+def _grade_cylinder(
+    rmse: float,
+    inliers_high: float,
+    inliers_med: float,
+    bbox_diag: float,
+) -> ConfidenceClass:
     rel = rmse / max(bbox_diag, 1e-12)
-    if rel <= CYL_HIGH_RMSE_REL and inliers >= CYL_HIGH_INLIER:
+    if rel <= CYL_HIGH_RMSE_REL and inliers_high >= CYL_HIGH_INLIER:
         return ConfidenceClass.HIGH
-    if rel <= CYL_MED_RMSE_REL and inliers >= CYL_MED_INLIER:
+    if rel <= CYL_MED_RMSE_REL and inliers_med >= CYL_MED_INLIER:
         return ConfidenceClass.MEDIUM
     return ConfidenceClass.LOW
 

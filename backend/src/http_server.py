@@ -269,19 +269,22 @@ def api_intent_overlays():
 
 @app.post("/api/intent/override")
 def api_intent_override(params: dict = {}):
-    """Record a manual override on the current ReconstructionState.
+    """Record a manual override on the current ReconstructionState, and for
+    force_plane / force_cylinder, immediately refit the affected regions so
+    the user sees the result without rerunning the whole intent pass.
 
     Body: { kind: "force_plane"|"force_cylinder"|"merge"|"split"|
                   "mark_sharp"|"exclude"|"force_coaxial"|"force_coplanar",
             region_ids: [int, ...],
             payload: {...} }
 
-    E0 stores the constraint on the state but does not yet propagate it
-    into a global solver — that's the next milestone. The hook exists so
-    the manual-correction tools have a stable place to land.
+    Global constraints (force_coaxial / force_coplanar) are still recorded
+    only — they need a multi-region solver which is the next milestone.
     """
     try:
+        import numpy as np
         from pipeline.reconstruction.state import Constraint, PrimitiveType
+        from pipeline.reconstruction.fitting import fit_region
         state = SESSION.get("recon_state")
         if state is None:
             raise HTTPException(400, "No reconstruction state — run /api/intent/run first")
@@ -292,19 +295,55 @@ def api_intent_override(params: dict = {}):
         payload = params.get("payload") or {}
         c = Constraint(kind=kind, region_ids=region_ids, payload=payload)
         state.constraints.append(c)
-        # The narrowest immediate effect E0 supports: force a region's type
-        # bit on the Region itself, and mark exclusions.
+
+        full_mesh = SESSION.get("preprocessed") or SESSION.get("mesh")
+        if full_mesh is not None:
+            full_vertices = np.asarray(full_mesh.vertices, dtype=np.float64)
+            full_faces = np.asarray(full_mesh.faces, dtype=np.int64)
+            try:
+                full_face_normals = np.asarray(full_mesh.face_normals, dtype=np.float64)
+            except Exception:
+                tri = full_vertices[full_faces]
+                cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+                nrm = np.linalg.norm(cross, axis=1, keepdims=True)
+                full_face_normals = cross / np.maximum(nrm, 1e-12)
+        else:
+            full_vertices = full_faces = full_face_normals = None
+
+        refit_ids = []
         for rid in region_ids:
             r = state.regions.get(rid)
             if r is None:
                 continue
             if kind == "force_plane":
                 r.forced_type = PrimitiveType.PLANE
+                refit_ids.append(rid)
             elif kind == "force_cylinder":
                 r.forced_type = PrimitiveType.CYLINDER
+                refit_ids.append(rid)
             elif kind == "exclude":
                 r.excluded = True
-        return {"ok": True, "n_constraints": len(state.constraints)}
+
+        # Immediate refit so the override endpoint does its one job. Falls
+        # back silently if we don't have a full mesh on the session.
+        if full_vertices is not None:
+            for rid in refit_ids:
+                r = state.regions[rid]
+                if r.full_face_indices.size == 0:
+                    continue
+                verts_idx = np.unique(full_faces[r.full_face_indices].flatten())
+                if verts_idx.size < 8:
+                    continue
+                pts = full_vertices[verts_idx]
+                norms = full_face_normals[r.full_face_indices]
+                r.fit = fit_region(pts, norms, fit_source="override", forced_type=r.forced_type)
+
+        return {
+            "ok": True,
+            "n_constraints": len(state.constraints),
+            "refit_region_ids": refit_ids,
+            "summary": state.summary(),
+        }
     except HTTPException:
         raise
     except Exception as e:

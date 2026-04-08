@@ -54,25 +54,37 @@ def grow_regions(
         if labels[seed] >= 0:
             continue
         labels[seed] = cur_label
-        running_normal = proxy.face_normals[seed].astype(np.float64).copy()
-        running_count = 1
+        # Running normal is area-weighted (B3 fix) — kept around so we can
+        # report a stable region orientation later, but it is NO LONGER
+        # used as the soft-gate reference. Comparing every new face to the
+        # running mean breaks smooth curved surfaces (notably partial
+        # cylinders): on a half-tube arc the mean drifts to the arc-average
+        # direction and the next face looks 20°+ off the mean even though
+        # it is only 3° off the previous face. The grower then carves the
+        # cylinder into ~10 fragments which the plane fitter happily calls
+        # HIGH plane. The fix is to gate against the LOCAL source face we
+        # are growing from — sharp mechanical edges are still caught by
+        # the hard-cut on boundary confidence above.
+        running_normal = (
+            proxy.face_normals[seed].astype(np.float64)
+            * float(proxy.face_areas[seed])
+        )
 
         q = deque([seed])
         while q:
             fi = q.popleft()
+            src_normal = proxy.face_normals[fi]
             for nb, ei in signals.face_adj[fi]:
                 if labels[nb] >= 0:
                     continue
                 if signals.confidence[ei] > HARD_CUT_CONFIDENCE:
                     continue
-                # Soft gate: don't cross even a mild edge if the normal jump
-                # against the running region is too big.
-                ref = running_normal / max(np.linalg.norm(running_normal), 1e-12)
-                if float(np.dot(proxy.face_normals[nb], ref)) < cos_gate:
+                # Soft gate against the local source face — lets smooth
+                # curved surfaces (cylinders) grow as one region.
+                if float(np.dot(proxy.face_normals[nb], src_normal)) < cos_gate:
                     continue
                 labels[nb] = cur_label
-                running_normal += proxy.face_normals[nb]
-                running_count += 1
+                running_normal += proxy.face_normals[nb] * float(proxy.face_areas[nb])
                 q.append(nb)
 
         cur_label += 1

@@ -159,7 +159,10 @@ def run_intent_segmentation(
         # mesh orientation and aren't smoothed across mechanical edges the
         # way vertex normals are.
         norms = full_face_normals[r.full_face_indices]
-        refit = fit_region(pts, norms, fit_source="fullres")
+        # Honour the manual override if the user has pinned a type on this
+        # region. forced_type used to be stored-only (B2 in the initial
+        # commit) — it now reaches the fitter.
+        refit = fit_region(pts, norms, fit_source="fullres", forced_type=r.forced_type)
         # We always replace the fit with the full-resolution one — it has
         # the actual primitive parameters. fit_proxy is preserved as a
         # diagnostic so the frontend can show "proxy was HIGH plane,
