@@ -235,6 +235,172 @@ def test_force_plane_override_takes_effect():
 
 
 # ────────────────────────────────────────────────────────────────────
+# Real-mesh smoke tests
+#
+# These run against the two mechanical meshes shipped in datasets/samples/.
+# They are deliberately LOOSE — specific HIGH/MEDIUM counts shift easily
+# when thresholds change, so the assertions only lock in the qualitative
+# story:
+#   • fandisk is a CAD-authored mechanical part → should produce many
+#     HIGH fits and significant area-explained.
+#   • rocker-arm is a smooth organic/freeform part → should produce ~zero
+#     HIGH fits; region growing captures it as one mega-region which the
+#     fitter correctly refuses to call a plane or cylinder. This is a
+#     KNOWN ARCHITECTURAL LIMIT of the current grower (no curvature-aware
+#     seeds), not a fitter bug. The test locks it in as "stays honest"
+#     rather than pretending the rocker arm is made of primitives.
+#
+# Tests are skipped cleanly if the fixture files are missing, so the
+# suite still works in environments that don't ship the sample meshes.
+# ────────────────────────────────────────────────────────────────────
+
+SAMPLES_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "datasets", "samples"))
+
+
+def _load_sample(name: str):
+    path = os.path.join(SAMPLES_DIR, name)
+    if not os.path.isfile(path):
+        return None
+    return trimesh.load(path, force="mesh", process=True)
+
+
+def test_fandisk_real_mechanical_mesh():
+    """Fandisk — the canonical CAD-authored mechanical test mesh.
+
+    This is NOT a scan: it's clean, watertight, has sharp mechanical
+    edges, several planar faces, a few cylindrical holes and bevel
+    fillets. It is the easiest "real" mesh E0 will ever see.
+
+    We require:
+      - at least 8 HIGH primitive fits total (planes + cylinders)
+      - at least 1 HIGH cylinder (the cylindrical features)
+      - at least 40% area-explained at HIGH confidence
+      - NO mega-region that owns >85% of the area (that would mean the
+        grower collapsed the whole mesh into one blob — the rocker-arm
+        failure mode).
+    """
+    mesh = _load_sample("fandisk.obj")
+    if mesh is None:
+        print("  (skipping fandisk test — fixture not present)")
+        return
+    state = _run(mesh, target_proxy_faces=20000, min_region_faces=16)
+    s = state.summary()
+    n_high = s["n_high_plane_fits"] + s["n_high_cylinder_fits"]
+    assert n_high >= 8, f"fandisk: expected ≥8 HIGH fits, got {n_high}"
+    assert s["n_high_cylinder_fits"] >= 1, (
+        f"fandisk: expected ≥1 HIGH cylinder, got {s['n_high_cylinder_fits']}"
+    )
+    assert s["explained_area_high_pct"] >= 40.0, (
+        f"fandisk: expected ≥40% area explained, got {s['explained_area_high_pct']:.1f}%"
+    )
+    max_region_frac = max(
+        (r.area_fraction for r in state.regions.values()), default=0.0
+    )
+    assert max_region_frac < 0.85, (
+        f"fandisk: largest region covers {max_region_frac*100:.1f}% of area "
+        f"(grower collapsed into mega-region)"
+    )
+
+
+def test_scanned11_raw_baseline():
+    """scanned11.stl — a real 366k-face raw scan (not committed to git;
+    extracted from scanned11.rar on origin/main into fixtures_local/).
+
+    This test locks in the CURRENT BASELINE on a real scan so that any
+    future change to the grower, the boundary signal, or the fit gates
+    can be measured against a concrete "before" number. The numbers
+    below are not a target — they are a floor. If you improve the
+    grower you should see n_high_fits go UP and mega_region_frac go
+    DOWN. If this test starts failing in the "too good" direction,
+    UPDATE the baseline; don't relax it silently.
+
+    Current baseline (E0 commit d198dc9 + perf fix, raw scan, no
+    cleanup, default params):
+        regions                     ~35
+        HIGH plane                  2
+        HIGH cylinder               2
+        UNKNOWN                     30
+        explained_area_high_pct     ~2%
+        largest region area frac    ~0.94  (mega-region failure mode)
+
+    Root cause: DIHEDRAL_SATURATION_DEG = 60° is calibrated for clean
+    CAD geometry. On this scan the p95 dihedral is ~26°, so real
+    mechanical edges only reach confidence ~0.43 (below HARD_CUT=0.55)
+    and the grower walks across them. Adjusting the saturation to
+    match the per-mesh dihedral distribution is the next concrete
+    experiment.
+    """
+    scan_path = os.path.join(HERE, "fixtures_local", "scanned11.stl")
+    if not os.path.isfile(scan_path):
+        print(f"  (skipping scanned11 test — fixture not present at {scan_path})")
+        return
+    mesh = trimesh.load(scan_path, force="mesh", process=True)
+    state = _run(mesh, target_proxy_faces=30000, min_region_faces=20)
+    s = state.summary()
+    n_high = s["n_high_plane_fits"] + s["n_high_cylinder_fits"]
+    max_region_frac = max(
+        (r.area_fraction for r in state.regions.values()), default=0.0
+    )
+
+    # These assertions are DELIBERATELY LOOSE — they lock in the floor,
+    # not the ceiling, so that improvements don't falsely trip the test.
+    #
+    #   n_high >= 2          : at least the 2 high cylinders that exist
+    #                          today must remain detected.
+    #   max_region_frac       : we assert the mega-region exists today so
+    #                          we notice when someone finally kills it.
+    #                          Remove this lower bound if/when you do.
+    assert n_high >= 2, (
+        f"scanned11 regression: only {n_high} HIGH fits (baseline was 4)"
+    )
+    # Acknowledged failure mode — REMOVE this assertion the day the
+    # grower stops producing a mega-region on scans.
+    assert max_region_frac >= 0.70, (
+        f"scanned11: largest region only covers {max_region_frac*100:.1f}% "
+        f"— did the grower just start working on raw scans? Update the baseline!"
+    )
+
+
+def test_rocker_arm_freeform_stays_honest():
+    """Rocker arm — smooth freeform organic part.
+
+    No sharp mechanical edges anywhere, just curvature blends. The
+    current region grower has no curvature-aware seeding, so it walks
+    across the entire surface in one pass and produces one mega-region
+    covering >90% of the area. The fitter correctly refuses to call
+    that mega-region a plane or a cylinder.
+
+    This test LOCKS IN the honest behaviour: we expect very few (or
+    zero) HIGH fits on a freeform part. If some day the grower gains
+    curvature-aware seeds and starts producing real HIGH fits here,
+    that's an improvement and the test should be updated — NOT relaxed
+    silently to accept false confidence.
+    """
+    mesh = _load_sample("rocker-arm.obj")
+    if mesh is None:
+        print("  (skipping rocker-arm test — fixture not present)")
+        return
+    state = _run(mesh, target_proxy_faces=20000, min_region_faces=16)
+    s = state.summary()
+    n_high = s["n_high_plane_fits"] + s["n_high_cylinder_fits"]
+    # Honesty: at most 2 HIGH fits on a genuinely freeform part.
+    assert n_high <= 2, (
+        f"rocker-arm: {n_high} HIGH fits on a freeform part is suspicious "
+        f"(over-confident segmentation?)"
+    )
+    # Acknowledged mega-region: current grower produces one giant region.
+    # The test doesn't assert this as GOOD — it asserts the current
+    # behaviour so we notice if it changes.
+    max_region_frac = max(
+        (r.area_fraction for r in state.regions.values()), default=0.0
+    )
+    assert max_region_frac >= 0.50, (
+        f"rocker-arm: largest region only covers {max_region_frac*100:.1f}% "
+        f"— if the grower stopped producing a mega-region, update this test."
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
 # Runner (pytest-compatible + standalone)
 # ────────────────────────────────────────────────────────────────────
 
@@ -243,6 +409,9 @@ ALL_TESTS = [
     ("box_plus_boss", test_box_plus_boss_high_fits),
     ("partial_cylinder", test_partial_cylinder_is_cylinder),
     ("uneven_tessellation", test_uneven_tessellation_not_overfragmented),
+    ("fandisk_real_mesh", test_fandisk_real_mechanical_mesh),
+    ("rocker_arm_freeform", test_rocker_arm_freeform_stays_honest),
+    ("scanned11_raw_baseline", test_scanned11_raw_baseline),
     ("force_plane_override", test_force_plane_override_takes_effect),
 ]
 

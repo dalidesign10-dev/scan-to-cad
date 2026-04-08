@@ -1,0 +1,17 @@
+# Local test fixtures — not committed to git.
+#
+# Files in here are mesh scans that are too large to commit (e.g. the
+# 67MB scanned11.stl extracted from scanned11.rar on origin/main). The
+# real-scan tests in test_intent_e0.py look for files here and skip
+# cleanly if they don't exist, so the suite still works in environments
+# that don't have the scans locally.
+#
+# To populate this directory from the repo's RAR archive:
+#     mkdir -p backend/tests/fixtures_local
+#     git show origin/main:scanned11.rar > /tmp/scanned11.rar
+#     unar -o /tmp/scanned11 /tmp/scanned11.rar
+#     cp /tmp/scanned11/scanned11.stl backend/tests/fixtures_local/
+
+*
+!.gitignore
+!README

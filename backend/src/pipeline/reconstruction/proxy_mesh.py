@@ -43,7 +43,8 @@ def build_proxy_mesh(
     if progress_callback:
         progress_callback("intent.proxy", 5, f"Decimating {n_full:,} → ~{target_face_count:,} faces...")
 
-    if n_full <= target_face_count:
+    skipped_decimation = n_full <= target_face_count
+    if skipped_decimation:
         # Use the cleaned mesh directly as its own proxy.
         proxy_vertices = full_vertices.copy()
         proxy_faces = full_faces.copy()
@@ -79,39 +80,47 @@ def build_proxy_mesh(
     if progress_callback:
         progress_callback("intent.proxy", 45, "Building face_map (full -> proxy)...")
 
-    full_centroids = _face_centroids(full_vertices, full_faces)
-    proxy_centroids = _face_centroids(proxy_vertices, proxy_faces)
+    if skipped_decimation:
+        # Proxy IS the full mesh — face_map is the identity. Running the
+        # K-nearest KD-tree dance on ~13k faces took ~40s on fandisk for
+        # literally no benefit (every face maps to itself).
+        face_map = np.arange(n_full, dtype=np.int64)
+    else:
+        full_centroids = _face_centroids(full_vertices, full_faces)
+        proxy_centroids = _face_centroids(proxy_vertices, proxy_faces)
 
-    # We also need full-res face normals to disambiguate the "full-res face
-    # on a sharp corner maps to the proxy face on the wrong side" failure
-    # (B4 in the initial commit). Cheap: we already have the formula.
-    full_face_normals, _ = _face_normals_and_areas(full_vertices, full_faces)
+        # We also need full-res face normals to disambiguate the "full-res
+        # face on a sharp corner maps to the proxy face on the wrong side"
+        # failure (B4 in the initial commit). Cheap: we already have the
+        # formula.
+        full_face_normals, _ = _face_normals_and_areas(full_vertices, full_faces)
 
-    # Open3d KDTreeFlann works on point clouds; cheap and avoids extra deps.
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(proxy_centroids)
-    kdt = o3d.geometry.KDTreeFlann(pcd)
+        # Open3d KDTreeFlann works on point clouds; cheap and avoids extra
+        # deps.
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(proxy_centroids)
+        kdt = o3d.geometry.KDTreeFlann(pcd)
 
-    # K-nearest + normal agreement tie-breaker. Nearest centroid alone can
-    # map a full-res face on one side of a mechanical edge to a proxy face
-    # on the other side when the proxy is coarse. For each full-res face,
-    # we fetch the K closest proxy faces and pick the one whose normal is
-    # most aligned with the full-res face normal — the proxy face "on the
-    # same side of the edge" always wins.
-    K = min(6, int(proxy_faces.shape[0]))
-    face_map = np.zeros(n_full, dtype=np.int64)
-    for i, c in enumerate(full_centroids):
-        _, idx, _ = kdt.search_knn_vector_3d(c, K)
-        if len(idx) == 0:
-            face_map[i] = 0
-            continue
-        if len(idx) == 1:
-            face_map[i] = int(idx[0])
-            continue
-        cand = np.asarray(idx, dtype=np.int64)
-        dots = proxy_face_normals[cand] @ full_face_normals[i]
-        best = int(cand[int(np.argmax(dots))])
-        face_map[i] = best
+        # K-nearest + normal agreement tie-breaker. Nearest centroid alone
+        # can map a full-res face on one side of a mechanical edge to a
+        # proxy face on the other side when the proxy is coarse. For each
+        # full-res face, we fetch the K closest proxy faces and pick the
+        # one whose normal is most aligned with the full-res face normal
+        # — the proxy face "on the same side of the edge" always wins.
+        K = min(6, int(proxy_faces.shape[0]))
+        face_map = np.zeros(n_full, dtype=np.int64)
+        for i, c in enumerate(full_centroids):
+            _, idx, _ = kdt.search_knn_vector_3d(c, K)
+            if len(idx) == 0:
+                face_map[i] = 0
+                continue
+            if len(idx) == 1:
+                face_map[i] = int(idx[0])
+                continue
+            cand = np.asarray(idx, dtype=np.int64)
+            dots = proxy_face_normals[cand] @ full_face_normals[i]
+            best = int(cand[int(np.argmax(dots))])
+            face_map[i] = best
 
     # Build inverse face map (proxy -> full[]) by argsort once.
     if progress_callback:
