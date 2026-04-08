@@ -112,6 +112,9 @@ export function PipelinePanel() {
     history, future, undo, redo,
     runPoint2Cyl, point2cylResult, showPoint2Cyl, togglePoint2Cyl,
     buildPolyhedralBrep, filletSharpEdges, chamferSharpEdges, exportBrep,
+    runIntentSegmentation, intentSummary, intentRegions,
+    showIntentRegionColors, toggleIntentRegionColors,
+    showIntentGizmos, toggleIntentGizmos,
   } = usePipelineStore()
 
   const [brepTarget, setBrepTarget] = useState(2000)
@@ -129,6 +132,8 @@ export function PipelinePanel() {
   const [angleThresh, setAngleThresh] = useState(60)
   const [poissonDepth, setPoissonDepth] = useState(10)
   const [sampleCount, setSampleCount] = useState(400000)
+  const [intentTargetFaces, setIntentTargetFaces] = useState(30000)
+  const [intentMinRegionFaces, setIntentMinRegionFaces] = useState(12)
   const [showCleanupAdv, setShowCleanupAdv] = useState(false)
   const [cageMinInlier, setCageMinInlier] = useState(0.85)
   const [cagePlaneAngle, setCagePlaneAngle] = useState(5)
@@ -195,6 +200,103 @@ export function PipelinePanel() {
               />
             </div>
           </div>
+        )}
+      </StepCard>
+
+      <StepCard title="E0. Intent Reconstruction (debug)" requiredStage="preprocessed">
+        <div style={{ fontSize: '11px', color: '#aaa', marginBottom: '6px' }}>
+          Proxy decimate → hybrid sharp-edge boundaries → region grow →
+          plane / cylinder / unknown fits with confidence classes. Honest
+          UNKNOWNs are expected. Polyhedral export path is unaffected.
+        </div>
+        <div style={styles.paramRow}>
+          <span>Proxy target faces</span>
+          <input
+            type="number"
+            style={styles.input}
+            min={5000}
+            max={100000}
+            step={1000}
+            value={intentTargetFaces}
+            onChange={(e) => setIntentTargetFaces(Number(e.target.value))}
+          />
+        </div>
+        <div style={styles.paramRow}>
+          <span>Min region faces</span>
+          <input
+            type="number"
+            style={styles.input}
+            min={4}
+            max={500}
+            value={intentMinRegionFaces}
+            onChange={(e) => setIntentMinRegionFaces(Number(e.target.value))}
+          />
+        </div>
+        <button
+          style={{
+            ...styles.btn,
+            opacity: meshInfo && !loading ? 1 : 0.5,
+            background: '#48dbfb',
+            color: '#0a0a1a',
+            fontWeight: 600,
+          }}
+          onClick={() =>
+            runIntentSegmentation({
+              target_proxy_faces: intentTargetFaces,
+              min_region_faces: intentMinRegionFaces,
+            })
+          }
+          disabled={!meshInfo || loading}
+        >
+          {loading ? 'Running E0…' : 'Run E0 Intent'}
+        </button>
+        {intentSummary && (
+          <div style={{ fontSize: '11px', color: '#aaa', marginTop: '6px', lineHeight: '1.5' }}>
+            <div>
+              <span style={{ color: '#e0e0e0' }}>{intentSummary.n_regions}</span> regions ·
+              {' '}<span style={{ color: '#e0e0e0' }}>{intentSummary.n_boundaries}</span> bdys
+            </div>
+            <div>
+              <span style={{ color: '#4ecca3' }}>{intentSummary.n_high_plane_fits}</span> high planes,
+              {' '}<span style={{ color: '#e94560' }}>{intentSummary.n_high_cylinder_fits}</span> high cyl,
+              {' '}<span style={{ color: '#888' }}>{intentSummary.n_unknown_regions}</span> unknown
+            </div>
+            <div>
+              area-explained:
+              {' '}<span style={{ color: '#feca57' }}>
+                {(intentSummary.explained_area_high_pct ?? 0).toFixed(1)}%
+              </span>
+            </div>
+            <div style={{ color: '#666' }}>
+              rmse plane {intentSummary.mean_rmse_plane?.toFixed(3) ?? '0'} ·
+              cyl {intentSummary.mean_rmse_cylinder?.toFixed(3) ?? '0'} ·
+              {' '}{(intentSummary.elapsed_sec ?? 0).toFixed(1)}s
+            </div>
+            <div style={{ color: '#666' }}>
+              proxy {intentSummary.proxy?.proxy_faces?.toLocaleString() ?? '?'} /
+              {' '}{intentSummary.proxy?.full_faces?.toLocaleString() ?? '?'} faces
+            </div>
+          </div>
+        )}
+        {intentRegions && intentRegions.length > 0 && (
+          <>
+            <label style={{ fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px', marginTop: '6px' }}>
+              <input
+                type="checkbox"
+                checked={showIntentRegionColors}
+                onChange={toggleIntentRegionColors}
+              />
+              Tint mesh by region/type/confidence
+            </label>
+            <label style={{ fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <input
+                type="checkbox"
+                checked={showIntentGizmos}
+                onChange={toggleIntentGizmos}
+              />
+              Show axes / normals / sharp edges
+            </label>
+          </>
         )}
       </StepCard>
 

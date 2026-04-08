@@ -41,6 +41,9 @@ SESSION = {
     "merge_parent": {},
     # User-created infinite planes (each: {normal, d, centroid, source_patch_ids})
     "user_planes": [],
+    # Phase E0 — mechanical intent reconstruction state. Single object,
+    # NOT a bag of session keys. See pipeline.reconstruction.state.
+    "recon_state": None,
 }
 
 
@@ -208,7 +211,102 @@ def api_cleanup_mesh(params: dict = {}):
     try:
         from pipeline.cleanup import cleanup_mesh
         result = cleanup_mesh(params, progress_callback=progress_noop, session=SESSION)
+        # Cleanup invalidates any prior intent reconstruction.
+        SESSION["recon_state"] = None
         return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Phase E0 — Mechanical intent reconstruction
+# ─────────────────────────────────────────────────────────────────────────
+# These endpoints build and inspect a single ReconstructionState held on
+# SESSION["recon_state"]. They do not interact with Phase A/B/C state at
+# all — Rough Export and the polyhedral path are unaffected.
+
+@app.post("/api/intent/run")
+def api_intent_run(params: dict = {}):
+    """Build a fresh ReconstructionState from the current cleaned mesh.
+
+    Body (all optional):
+      target_proxy_faces  int   default 30000
+      min_region_faces    int   default 12
+    """
+    try:
+        from pipeline.reconstruction import run_intent_segmentation
+        return run_intent_segmentation(params, progress_callback=progress_noop, session=SESSION)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/intent/state")
+def api_intent_state():
+    """Return the current ReconstructionState as JSON (regions + boundaries)."""
+    try:
+        from pipeline.reconstruction import get_intent_state
+        return get_intent_state(SESSION)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/intent/overlays")
+def api_intent_overlays():
+    """Return debug overlay data: per-face region ids, per-region gizmos,
+    and the sharp-edge segments. Used by the IntentOverlay frontend layer."""
+    try:
+        from pipeline.reconstruction import get_intent_overlays
+        return get_intent_overlays(SESSION)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/intent/override")
+def api_intent_override(params: dict = {}):
+    """Record a manual override on the current ReconstructionState.
+
+    Body: { kind: "force_plane"|"force_cylinder"|"merge"|"split"|
+                  "mark_sharp"|"exclude"|"force_coaxial"|"force_coplanar",
+            region_ids: [int, ...],
+            payload: {...} }
+
+    E0 stores the constraint on the state but does not yet propagate it
+    into a global solver — that's the next milestone. The hook exists so
+    the manual-correction tools have a stable place to land.
+    """
+    try:
+        from pipeline.reconstruction.state import Constraint, PrimitiveType
+        state = SESSION.get("recon_state")
+        if state is None:
+            raise HTTPException(400, "No reconstruction state — run /api/intent/run first")
+        kind = params.get("kind")
+        if not kind:
+            raise HTTPException(400, "kind required")
+        region_ids = [int(r) for r in (params.get("region_ids") or [])]
+        payload = params.get("payload") or {}
+        c = Constraint(kind=kind, region_ids=region_ids, payload=payload)
+        state.constraints.append(c)
+        # The narrowest immediate effect E0 supports: force a region's type
+        # bit on the Region itself, and mark exclusions.
+        for rid in region_ids:
+            r = state.regions.get(rid)
+            if r is None:
+                continue
+            if kind == "force_plane":
+                r.forced_type = PrimitiveType.PLANE
+            elif kind == "force_cylinder":
+                r.forced_type = PrimitiveType.CYLINDER
+            elif kind == "exclude":
+                r.excluded = True
+        return {"ok": True, "n_constraints": len(state.constraints)}
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, str(e))
