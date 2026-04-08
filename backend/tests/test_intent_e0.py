@@ -59,10 +59,19 @@ def _session(mesh: trimesh.Trimesh, mesh_id: str = "test") -> dict:
     return {"mesh": mesh, "preprocessed": mesh, "mesh_id": mesh_id}
 
 
-def _run(mesh: trimesh.Trimesh, target_proxy_faces: int = 4000, min_region_faces: int = 8):
+def _run(
+    mesh: trimesh.Trimesh,
+    target_proxy_faces: int = 4000,
+    min_region_faces: int = 8,
+    growth_mode: str = "dihedral",
+):
     sess = _session(mesh)
     run_intent_segmentation(
-        {"target_proxy_faces": target_proxy_faces, "min_region_faces": min_region_faces},
+        {
+            "target_proxy_faces": target_proxy_faces,
+            "min_region_faces": min_region_faces,
+            "growth_mode": growth_mode,
+        },
         progress_callback=lambda *a, **k: None,
         session=sess,
     )
@@ -361,6 +370,64 @@ def test_scanned11_raw_baseline():
     )
 
 
+def test_scanned11_fit_driven_segments_primitives():
+    """scanned11.stl with the RANSAC-style fit-driven grower.
+
+    Unlike the dihedral baseline above, this test uses
+    growth_mode="fit_driven": seed a face, fit a plane or cylinder to its
+    small neighborhood, grow BFS while new faces stay inside the fit's
+    residual + normal tolerance. Boundaries fall out of the fit itself,
+    so we don't need dihedral edges to form closed loops — which they
+    don't on a noisy scan.
+
+    This is the concrete fix for the mega-region failure mode. On
+    scanned11 the dihedral grower produces ~2% area explained in HIGH
+    fits with a 94% mega-region. The fit-driven grower produces >=40%
+    area explained in HIGH fits, no mega-region, and >=10 HIGH planes.
+
+    Known limitation (intentional): the fit-driven grower currently
+    seeds by face area, so large flat surfaces absorb before tight
+    cylinder patches get a chance. Scanned11 produces many HIGH planes
+    but few HIGH cylinders here. A cylinder-first seeding pass is the
+    next step; it doesn't belong in this test.
+    """
+    scan_path = os.path.join(HERE, "fixtures_local", "scanned11.stl")
+    if not os.path.isfile(scan_path):
+        print(f"  (skipping scanned11 fit_driven — fixture not present at {scan_path})")
+        return
+    mesh = trimesh.load(scan_path, force="mesh", process=True)
+    state = _run(
+        mesh,
+        target_proxy_faces=30000,
+        min_region_faces=20,
+        growth_mode="fit_driven",
+    )
+    s = state.summary()
+    n_high = s["n_high_plane_fits"] + s["n_high_cylinder_fits"]
+    max_region_frac = max(
+        (r.area_fraction for r in state.regions.values()), default=0.0
+    )
+
+    # HIGH count: the dihedral baseline finds 2. Fit-driven must dwarf
+    # that. Observed at this commit: ~26 HIGH (all planes).
+    assert n_high >= 10, (
+        f"scanned11 fit_driven: expected >=10 HIGH fits, got {n_high}"
+    )
+    # Area explained by HIGH fits: baseline is ~1%. Fit-driven observed
+    # ~45%. Floor at 25% to leave headroom for tuning.
+    assert s["explained_area_high_pct"] >= 25.0, (
+        f"scanned11 fit_driven: only {s['explained_area_high_pct']:.1f}% "
+        f"area explained at HIGH confidence"
+    )
+    # Mega-region must be gone. Baseline is 0.94; fit-driven observed
+    # 0.12. Hard ceiling at 0.40 — larger than that means a major chunk
+    # of the scan went unsegmented.
+    assert max_region_frac <= 0.40, (
+        f"scanned11 fit_driven: largest region still {max_region_frac*100:.1f}% "
+        f"— did the mega-region come back?"
+    )
+
+
 def test_rocker_arm_freeform_stays_honest():
     """Rocker arm — smooth freeform organic part.
 
@@ -412,6 +479,7 @@ ALL_TESTS = [
     ("fandisk_real_mesh", test_fandisk_real_mechanical_mesh),
     ("rocker_arm_freeform", test_rocker_arm_freeform_stays_honest),
     ("scanned11_raw_baseline", test_scanned11_raw_baseline),
+    ("scanned11_fit_driven", test_scanned11_fit_driven_segments_primitives),
     ("force_plane_override", test_force_plane_override_takes_effect),
 ]
 

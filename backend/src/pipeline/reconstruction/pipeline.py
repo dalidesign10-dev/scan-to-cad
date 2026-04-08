@@ -53,9 +53,14 @@ def run_intent_segmentation(
     """Build a fresh ReconstructionState on `session["recon_state"]`.
 
     Params (all optional):
-        target_proxy_faces  int   default 30000
-        min_region_faces    int   default 12
-        force_rebuild       bool  default True
+        target_proxy_faces  int    default 30000
+        min_region_faces    int    default 12
+        growth_mode         str    default "dihedral" — {"dihedral","fit_driven"}
+        force_rebuild       bool   default True
+
+    growth_mode="dihedral" is the clean-CAD grower (hybrid boundary + soft
+    normal gate). growth_mode="fit_driven" is the RANSAC-style primitive
+    grower for scan data where dihedral boundaries don't form closed loops.
     """
     if session is None:
         raise ValueError("session required")
@@ -65,6 +70,9 @@ def run_intent_segmentation(
 
     target_proxy = int(params.get("target_proxy_faces", 30000))
     min_region_faces = int(params.get("min_region_faces", 12))
+    growth_mode = str(params.get("growth_mode", "dihedral"))
+    if growth_mode not in ("dihedral", "fit_driven"):
+        raise ValueError(f"unknown growth_mode: {growth_mode!r}")
 
     t0 = time.time()
     if progress_callback:
@@ -89,6 +97,7 @@ def run_intent_segmentation(
         signals,
         min_region_face_count=min_region_faces,
         progress_callback=lambda *a, **k: None,
+        mode=growth_mode,
     )
 
     if progress_callback:
@@ -173,6 +182,7 @@ def run_intent_segmentation(
         "elapsed_sec": float(time.time() - t0),
         "target_proxy_faces": int(target_proxy),
         "min_region_faces": int(min_region_faces),
+        "growth_mode": growth_mode,
     }
 
     state = ReconstructionState(
