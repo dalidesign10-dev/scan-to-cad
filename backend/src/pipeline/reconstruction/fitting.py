@@ -13,9 +13,12 @@ The fitter is honest:
 
 We do NOT touch spheres, tori (fillets), freeform, B-splines yet.
 
-Scale awareness: every numeric threshold is expressed relative to the
-region's own bbox diagonal, so the same code works on a 10mm boss and a
-500mm bracket without retuning.
+Scale awareness: every numeric threshold is expressed relative to a
+reference bbox diagonal. By default this is the region's own bbox
+diagonal, so the same code works on a 10mm boss and a 500mm bracket
+without retuning. Callers that know the full-mesh bbox should pass it
+as `reference_scale` so that small regions on large parts are graded
+against the mesh-level noise floor rather than their own tiny extent.
 """
 
 from typing import Optional
@@ -74,8 +77,9 @@ def fit_region(
     normals: Optional[np.ndarray],
     fit_source: str = "proxy",
     forced_type: Optional[PrimitiveType] = None,
+    reference_scale: Optional[float] = None,
 ) -> PrimitiveFit:
-    """Try plane then cylinder; return whichever wins, else UNKNOWN.
+    """Try plane then cylinder then cone; return whichever wins, else UNKNOWN.
 
     The decision is NOT just "best inlier ratio" — a plane that passes the
     HIGH gate always wins, even if the cylinder has marginally lower RMSE
@@ -87,13 +91,37 @@ def fit_region(
     an "override" note, skipping the type-selection ladder below. That's
     how a user saying "this region IS a plane, trust me" gets acted on
     without letting the override endpoint become decorative.
+
+    `reference_scale` is the bbox diagonal against which all relative
+    thresholds are measured. When None, the region's own bbox diagonal
+    is used (default, backward-compatible). The pipeline passes the
+    full-mesh bbox so that small regions on large parts are graded against
+    the mesh-level noise floor rather than their own extent — without this,
+    a 5mm patch on a 300mm scan with 0.05mm noise scores a 1% relative
+    RMSE (MEDIUM) when it should score 0.017% (HIGH).
     """
     if points.shape[0] < 8:
         return _unknown(np.array([]), fit_source, "too few points")
 
-    bbox_diag = float(np.linalg.norm(np.ptp(points, axis=0)))
-    if bbox_diag < 1e-9:
+    region_bbox = float(np.linalg.norm(np.ptp(points, axis=0)))
+    if region_bbox < 1e-9:
         return _unknown(np.array([]), fit_source, "degenerate bbox")
+
+    # When the caller provides a mesh-level reference scale, we floor the
+    # region's own bbox at a fraction of it. This prevents tiny regions on
+    # large parts from being over-penalized (noise RMSE / tiny-bbox =
+    # large relative residual → stuck at MEDIUM even when genuinely flat)
+    # without turning the whole mesh into "everything looks flat" the way
+    # using the raw mesh bbox would (0.5mm RMSE / 300mm mesh = 0.17% →
+    # false HIGH on curved patches). The 10% fraction means a region's
+    # effective scale is never smaller than 1/10 of the mesh, which is
+    # generous enough for 5mm patches on a 300mm scan but still catches
+    # curvature on regions that are >= 10% of the mesh diagonal.
+    _REF_SCALE_FLOOR = 0.10
+    if reference_scale is not None and reference_scale > 0:
+        bbox_diag = max(region_bbox, reference_scale * _REF_SCALE_FLOOR)
+    else:
+        bbox_diag = region_bbox
 
     if forced_type is not None:
         if forced_type == PrimitiveType.PLANE:

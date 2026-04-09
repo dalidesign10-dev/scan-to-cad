@@ -117,6 +117,11 @@ def run_intent_segmentation(
     full_vertices = np.asarray(full_mesh.vertices, dtype=np.float64)
     full_faces = np.asarray(full_mesh.faces, dtype=np.int64)
 
+    # Mesh-level reference scale: the full-mesh bbox diagonal. Passed to
+    # fit_region so that small regions are graded against the mesh-wide
+    # noise floor, not their own tiny extent.
+    mesh_bbox_diag = float(np.linalg.norm(np.ptp(full_vertices, axis=0)))
+
     full_face_areas = _face_areas(full_vertices, full_faces)
     total_full_area = float(full_face_areas.sum())
 
@@ -142,7 +147,8 @@ def run_intent_segmentation(
         proxy_vert_idx = np.unique(proxy.faces[proxy_face_idx].flatten())
         proxy_pts = proxy.vertices[proxy_vert_idx]
         proxy_norms = proxy.face_normals[proxy_face_idx]
-        proxy_fit = fit_region(proxy_pts, proxy_norms, fit_source="proxy")
+        proxy_fit = fit_region(proxy_pts, proxy_norms, fit_source="proxy",
+                               reference_scale=mesh_bbox_diag)
 
         regions[r] = Region(
             id=r,
@@ -171,7 +177,8 @@ def run_intent_segmentation(
         # Honour the manual override if the user has pinned a type on this
         # region. forced_type used to be stored-only (B2 in the initial
         # commit) — it now reaches the fitter.
-        refit = fit_region(pts, norms, fit_source="fullres", forced_type=r.forced_type)
+        refit = fit_region(pts, norms, fit_source="fullres", forced_type=r.forced_type,
+                           reference_scale=mesh_bbox_diag)
         # We always replace the fit with the full-resolution one — it has
         # the actual primitive parameters. fit_proxy is preserved as a
         # diagnostic so the frontend can show "proxy was HIGH plane,

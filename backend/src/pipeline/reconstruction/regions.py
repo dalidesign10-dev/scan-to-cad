@@ -231,6 +231,7 @@ def grow_regions_fit_driven(
         cos_plane_normal=cos_plane_normal,
         sin_cyl_perp=sin_cyl_perp,
         cone_normal_sin_tol=cone_normal_sin_tol,
+        reference_scale=bbox_diag,
     )
 
     if progress_callback:
@@ -297,7 +298,8 @@ def grow_regions_fit_driven(
         vert_idx = np.unique(proxy.faces[seed_idx].flatten())
         pts = proxy.vertices[vert_idx]
         norms = proxy.face_normals[seed_idx]
-        fit = fit_region(pts, norms, fit_source="fit_driven_seed")
+        fit = fit_region(pts, norms, fit_source="fit_driven_seed",
+                         reference_scale=bbox_diag)
 
         if fit.type == PrimitiveType.UNKNOWN:
             # No primitive fits the seed — claim just the seed's faces and
@@ -355,6 +357,7 @@ def grow_regions_fit_driven(
                     proxy.face_normals[region_idx],
                     fit_source="fit_driven_refit",
                     forced_type=fit.type,
+                    reference_scale=bbox_diag,
                 )
                 if refit.confidence_class != ConfidenceClass.REJECTED and refit.type == fit.type:
                     fit = refit
@@ -385,6 +388,7 @@ def _cylinder_seed_pass(
     cos_plane_normal: float,
     sin_cyl_perp: float,
     cone_normal_sin_tol: float,
+    reference_scale: float = 0.0,
 ) -> int:
     """Walk unlabeled faces, seed any neighborhood that looks like a
     cylindrical patch, force a cylinder fit, and grow it if the fit
@@ -438,6 +442,7 @@ def _cylinder_seed_pass(
             seed_normals,
             fit_source="cyl_seed",
             forced_type=PrimitiveType.CYLINDER,
+            reference_scale=reference_scale,
         )
         if fit.type != PrimitiveType.CYLINDER:
             continue
@@ -503,6 +508,7 @@ def _cylinder_seed_pass(
                     proxy.face_normals[region_idx],
                     fit_source="cyl_seed_refit",
                     forced_type=PrimitiveType.CYLINDER,
+                    reference_scale=reference_scale,
                 )
                 if (
                     refit.type == PrimitiveType.CYLINDER
@@ -526,6 +532,7 @@ def _cylinder_seed_pass(
                 proxy.face_normals[region_idx],
                 fit_source="cyl_seed_final",
                 forced_type=PrimitiveType.CYLINDER,
+                reference_scale=reference_scale,
             )
             if (
                 final.type == PrimitiveType.CYLINDER
@@ -555,6 +562,7 @@ def _cone_seed_pass(
     cos_plane_normal: float,
     sin_cyl_perp: float,
     cone_normal_sin_tol: float,
+    reference_scale: float = 0.0,
 ) -> int:
     """Walk unlabeled faces, seed any neighborhood that looks conical,
     force a cone fit, and grow it if the fit grades HIGH or MEDIUM.
@@ -620,6 +628,7 @@ def _cone_seed_pass(
             seed_normals,
             fit_source="cone_seed",
             forced_type=PrimitiveType.CONE,
+            reference_scale=reference_scale,
         )
         if fit.type != PrimitiveType.CONE:
             continue
@@ -670,6 +679,7 @@ def _cone_seed_pass(
                     proxy.face_normals[region_idx],
                     fit_source="cone_seed_refit",
                     forced_type=PrimitiveType.CONE,
+                    reference_scale=reference_scale,
                 )
                 if (
                     refit.type == PrimitiveType.CONE
@@ -694,6 +704,7 @@ def _cone_seed_pass(
                 proxy.face_normals[region_idx],
                 fit_source="cone_seed_final",
                 forced_type=PrimitiveType.CONE,
+                reference_scale=reference_scale,
             )
             if (
                 final.type == PrimitiveType.CONE
