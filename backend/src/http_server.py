@@ -233,6 +233,7 @@ def api_intent_run(params: dict = {}):
     Body (all optional):
       target_proxy_faces  int   default 30000
       min_region_faces    int   default 12
+      growth_mode         str   "dihedral" (default) | "fit_driven"
     """
     try:
         from pipeline.reconstruction import run_intent_segmentation

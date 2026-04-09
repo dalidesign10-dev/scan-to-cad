@@ -134,6 +134,7 @@ export function PipelinePanel() {
   const [sampleCount, setSampleCount] = useState(400000)
   const [intentTargetFaces, setIntentTargetFaces] = useState(30000)
   const [intentMinRegionFaces, setIntentMinRegionFaces] = useState(12)
+  const [intentGrowthMode, setIntentGrowthMode] = useState<'dihedral' | 'fit_driven'>('dihedral')
   const [showCleanupAdv, setShowCleanupAdv] = useState(false)
   const [cageMinInlier, setCageMinInlier] = useState(0.85)
   const [cagePlaneAngle, setCagePlaneAngle] = useState(5)
@@ -232,6 +233,19 @@ export function PipelinePanel() {
             onChange={(e) => setIntentMinRegionFaces(Number(e.target.value))}
           />
         </div>
+        <div style={styles.paramRow}>
+          <span>Growth mode</span>
+          <select
+            style={styles.input}
+            value={intentGrowthMode}
+            onChange={(e) =>
+              setIntentGrowthMode(e.target.value as 'dihedral' | 'fit_driven')
+            }
+          >
+            <option value="dihedral">dihedral (default)</option>
+            <option value="fit_driven">fit_driven (scans)</option>
+          </select>
+        </div>
         <button
           style={{
             ...styles.btn,
@@ -244,6 +258,7 @@ export function PipelinePanel() {
             runIntentSegmentation({
               target_proxy_faces: intentTargetFaces,
               min_region_faces: intentMinRegionFaces,
+              growth_mode: intentGrowthMode,
             })
           }
           disabled={!meshInfo || loading}
