@@ -1,15 +1,13 @@
-import { ipcMain, dialog, BrowserWindow } from 'electron'
+import { ipcMain, dialog } from 'electron'
 import { PythonBridge } from './pythonBridge'
 
-export function registerIpcHandlers(python: PythonBridge) {
-  // Forward progress events to renderer
-  python.on('progress', (data) => {
-    const win = BrowserWindow.getAllWindows()[0]
-    if (win) {
-      win.webContents.send('pipeline:progress', data)
-    }
-  })
-
+/**
+ * IPC handlers for the Electron main process. Only file dialogs are
+ * live — the renderer talks to the Python backend over HTTP on
+ * localhost:8321, not through IPC, so the old python:call / python:ping
+ * handlers were removed along with the stdio JSON-RPC plumbing.
+ */
+export function registerIpcHandlers(_python: PythonBridge) {
   // File open dialog
   ipcMain.handle('dialog:openFile', async () => {
     const result = await dialog.showOpenDialog({
@@ -32,15 +30,5 @@ export function registerIpcHandlers(python: PythonBridge) {
       ],
     })
     return result.canceled ? null : result.filePath
-  })
-
-  // Generic Python RPC call
-  ipcMain.handle('python:call', async (_, method: string, params: any) => {
-    return python.call(method, params)
-  })
-
-  // Ping to check Python is alive
-  ipcMain.handle('python:ping', async () => {
-    return python.call('ping')
   })
 }

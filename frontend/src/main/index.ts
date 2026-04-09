@@ -33,14 +33,39 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  // Start Python backend
-  pythonBridge = new PythonBridge()
-  await pythonBridge.spawn()
-
-  // Register IPC handlers
-  registerIpcHandlers(pythonBridge)
-
+  // Open the main window immediately so the user sees something while
+  // the Python backend is starting up. The renderer only talks to the
+  // backend on explicit user actions (button clicks), so a brief window
+  // where the UI is loaded but the backend isn't yet is fine.
   createWindow()
+
+  // Start Python backend in parallel. If it fails, tell the user
+  // exactly what's wrong instead of leaving a silent broken app.
+  pythonBridge = new PythonBridge()
+  try {
+    await pythonBridge.spawn()
+  } catch (err: any) {
+    console.error('[main] backend failed to start:', err)
+    dialog.showErrorBox(
+      'Backend failed to start',
+      [
+        'The Python backend could not be launched.',
+        '',
+        err?.message ?? String(err),
+        '',
+        'Common causes:',
+        '  • Python is not on PATH — install Python 3.10+',
+        '  • Backend deps missing — run:',
+        '      python -m pip install -r backend/requirements.txt',
+        '  • Port 8321 is already in use by another process',
+        '',
+        'The app window will remain open but pipeline actions will fail',
+        'until the backend is running.',
+      ].join('\n'),
+    )
+  }
+
+  registerIpcHandlers(pythonBridge)
 })
 
 app.on('window-all-closed', () => {
