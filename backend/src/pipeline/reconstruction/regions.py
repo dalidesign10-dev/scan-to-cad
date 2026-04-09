@@ -39,8 +39,19 @@ FIT_SEED_MIN_FACES = 24          # BFS from seed until >= this many faces (plane
 FIT_CYL_SEED_MIN_FACES = 12      # smaller seed for cylinder pass — small holes need to fit
 FIT_PLANE_TOL_REL = 0.008        # max |signed distance| / bbox for plane grow
 FIT_CYL_TOL_REL = 0.012          # max |radial residual| / bbox for cylinder grow
+FIT_CONE_TOL_REL = 0.018         # max perpendicular residual / bbox for cone grow
 FIT_PLANE_NORMAL_DEG = 18.0      # face-normal deviation from plane normal
 FIT_CYL_AXIS_PERP_DEG = 15.0     # face-normal may be this far from perpendicular-to-axis
+FIT_CONE_NORMAL_ANGLE_DEG = 15.0 # tolerance on |n·axis| - sin(α) alignment check
+
+# Boundary trim thresholds (fraction of the GROW tolerance). After BFS
+# growth, faces at region boundaries often have residuals just under the
+# grow tolerance — these inflate RMSE and suppress the HIGH-band inlier
+# ratio. The trim pass removes faces whose max-vertex residual exceeds
+# TRIM_FRAC of the original grow tolerance. 0.5 is aggressive (halves
+# the effective tolerance) but that's fine: the trim only removes a thin
+# boundary shell and the tiny-region absorber reclaims orphaned faces.
+TRIM_FRAC = 0.45
 
 # Cylinder-seed signature. The cheap SVD on the seed neighborhood's normals
 # decides whether it's worth trying a forced cylinder fit. A cylinder surface
@@ -69,8 +80,6 @@ CYL_SEED_MAX_RADIUS_FRAC_OF_MESH = 0.50
 # than CYL_SEED_SV2_MAX so that partial chamfer cones survive the filter;
 # CONE_SEED_MEAN_NORMAL_MIN is what actually rules cylinders (mean ≈ 0) out.
 FIT_CONE_SEED_MIN_FACES = 16
-FIT_CONE_TOL_REL = 0.018         # max perpendicular residual / bbox for cone grow
-FIT_CONE_NORMAL_ANGLE_DEG = 15.0 # tolerance on |n·axis| - sin(α) alignment check
 CONE_SEED_SV2_MAX = 0.32         # sv[2]/sv[0] — small circle spread, looser than cyl
 CONE_SEED_SV1_MIN = 0.15         # sv[1]/sv[0] — span the circle (not collapsed)
 CONE_SEED_MEAN_NORMAL_MIN = 0.10 # |mean(unit_n)| = sin(α); 0.10 → α ≳ 5.7°
@@ -368,12 +377,272 @@ def grow_regions_fit_driven(
     if progress_callback:
         progress_callback("intent.regions", 65, f"Initial fit-driven regions: {cur_label}")
 
+    # Boundary trim: remove the worst-fitting faces at each region's edge.
+    # The BFS grower accepts faces up to FIT_*_TOL_REL; the trim tightens
+    # each region to TRIM_FRAC of that tolerance.  This directly attacks
+    # the "stuck at MEDIUM" problem: boundary faces inflate RMSE and pull
+    # the HIGH-band inlier ratio below the gate.  Trimmed faces become -1
+    # and the tiny-region absorber merges them into neighbors.
+    labels = _trim_region_boundaries(
+        labels,
+        proxy,
+        bbox_diag=bbox_diag,
+        reference_scale=bbox_diag,
+        min_region_faces=min_region_face_count,
+    )
+
+    # Assign trimmed (-1) faces directly to their best adjacent labeled
+    # region. This avoids the explosion of thousands of individual orphan
+    # labels that overwhelmed the absorber in earlier attempts. Each
+    # trimmed face is boundary-adjacent to at least one labeled region;
+    # we pick the neighbor that shares the most edges (= most compatible
+    # geometry, since the grower already validated those adjacencies).
+    orphan_mask = labels == -1
+    if orphan_mask.any():
+        for fi in np.where(orphan_mask)[0]:
+            neighbor_labels: Dict[int, int] = {}
+            for nb, _ei in signals.face_adj[int(fi)]:
+                nb_lbl = int(labels[nb])
+                if nb_lbl >= 0:
+                    neighbor_labels[nb_lbl] = neighbor_labels.get(nb_lbl, 0) + 1
+            if neighbor_labels:
+                labels[fi] = max(neighbor_labels, key=neighbor_labels.get)
+        # Any remaining -1 faces (no labeled neighbors) get individual labels.
+        still_orphan = labels == -1
+        if still_orphan.any():
+            cur_label = int(labels.max()) + 1
+            for fi in np.where(still_orphan)[0]:
+                labels[fi] = cur_label
+                cur_label += 1
+
+    if progress_callback:
+        progress_callback("intent.regions", 72, "Trimmed boundaries; absorbing tiny regions...")
+
     labels = _absorb_tiny_regions(labels, proxy, signals, min_region_face_count)
+
+    if progress_callback:
+        progress_callback("intent.regions", 82, "Merging compatible adjacent regions...")
+
+    labels = _merge_compatible_regions(
+        labels,
+        proxy,
+        signals,
+        reference_scale=bbox_diag,
+        min_region_faces=min_region_face_count,
+    )
 
     if progress_callback:
         progress_callback("intent.regions", 100, f"Final regions: {int(labels.max()) + 1}")
 
     return labels
+
+
+# Merge thresholds. Two adjacent regions of the same primitive type are
+# "compatible" when their parameters agree within these tolerances. The
+# merge is only committed when the combined region's refit grades at
+# least as high as the better of the two originals.
+MERGE_PLANE_NORMAL_COS = 0.9975   # ≈ 4° between normals
+MERGE_PLANE_D_REL = 0.006         # |d₁ - d₂| / bbox_diag
+MERGE_CYL_AXIS_COS = 0.995       # ≈ 5.7° between axes
+MERGE_CYL_RADIUS_REL = 0.10      # |r₁ - r₂| / max(r₁, r₂)
+MERGE_CYL_CENTER_REL = 0.05      # lateral axis-to-axis / bbox_diag
+
+
+def _merge_compatible_regions(
+    labels: np.ndarray,
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    reference_scale: float,
+    min_region_faces: int,
+) -> np.ndarray:
+    """Merge adjacent regions whose primitive fits are compatible.
+
+    The idea: the BFS grower sometimes splits a single mechanical face
+    into two regions (different seeds that both grade MEDIUM). If the
+    two regions have the same primitive type with similar parameters,
+    the combined region has more inlier points and often grades HIGH.
+
+    Only merges that don't lower the best confidence class are kept.
+    """
+    n_labels = int(labels.max()) + 1 if labels.size else 0
+    if n_labels <= 1:
+        return labels
+
+    # Fit every region once.
+    fits = {}
+    for r in range(n_labels):
+        mask = labels == r
+        n_faces = int(mask.sum())
+        if n_faces < min_region_faces:
+            continue
+        idx = np.where(mask)[0].astype(np.int64)
+        vert_idx = np.unique(proxy.faces[idx].flatten())
+        if vert_idx.size < 8:
+            continue
+        pts = proxy.vertices[vert_idx]
+        norms = proxy.face_normals[idx]
+        fits[r] = fit_region(pts, norms, fit_source="merge_eval",
+                             reference_scale=reference_scale)
+
+    # Build region adjacency from edge data.
+    adj: Dict[int, set] = defaultdict(set)
+    for ei in range(signals.n_edges):
+        a = int(labels[signals.edge_face_pairs[ei, 0]])
+        b = int(labels[signals.edge_face_pairs[ei, 1]])
+        if a != b:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    class_order = {
+        ConfidenceClass.HIGH: 3,
+        ConfidenceClass.MEDIUM: 2,
+        ConfidenceClass.LOW: 1,
+        ConfidenceClass.REJECTED: 0,
+    }
+
+    # Greedy merge: process pairs sorted by combined face count
+    # (largest first, so we stabilize big regions before small ones).
+    counts = np.bincount(labels, minlength=n_labels)
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        # Collect candidate pairs.
+        pairs = []
+        seen = set()
+        for a in list(adj.keys()):
+            if a not in fits:
+                continue
+            for b in adj[a]:
+                if b not in fits:
+                    continue
+                key = (min(a, b), max(a, b))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if fits[a].type != fits[b].type:
+                    continue
+                if fits[a].type == PrimitiveType.UNKNOWN:
+                    continue
+                pairs.append((a, b, int(counts[a]) + int(counts[b])))
+
+        pairs.sort(key=lambda x: x[2], reverse=True)
+
+        for a, b, _ in pairs:
+            if a not in fits or b not in fits:
+                continue  # one side already merged away
+            fa, fb = fits[a], fits[b]
+            if fa.type != fb.type:
+                continue
+
+            if not _params_compatible(fa, fb, reference_scale):
+                continue
+
+            # Try the merge: combine faces, refit, check grade.
+            mask_a = labels == a
+            mask_b = labels == b
+            combined_idx = np.where(mask_a | mask_b)[0].astype(np.int64)
+            vert_idx = np.unique(proxy.faces[combined_idx].flatten())
+            if vert_idx.size < 8:
+                continue
+            pts = proxy.vertices[vert_idx]
+            norms = proxy.face_normals[combined_idx]
+            combined_fit = fit_region(
+                pts, norms, fit_source="merge_refit",
+                forced_type=fa.type,
+                reference_scale=reference_scale,
+            )
+            if combined_fit.confidence_class == ConfidenceClass.REJECTED:
+                continue
+
+            # Accept the merge if the combined grade is >= the best original.
+            best_orig = max(class_order[fa.confidence_class],
+                            class_order[fb.confidence_class])
+            combined_grade = class_order[combined_fit.confidence_class]
+            if combined_grade < best_orig:
+                continue
+
+            # Commit the merge: relabel b → a, update bookkeeping.
+            labels[mask_b] = a
+            counts[a] += counts[b]
+            counts[b] = 0
+            fits[a] = combined_fit
+            del fits[b]
+            # Update adjacency: b's neighbors become a's neighbors.
+            for nb in adj.get(b, set()):
+                if nb == a:
+                    continue
+                adj[a].add(nb)
+                adj[nb].discard(b)
+                adj[nb].add(a)
+            adj.pop(b, None)
+            adj[a].discard(b)
+            merged_any = True
+
+    # Contiguously relabel.
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    out = np.empty_like(labels)
+    for fi in range(labels.shape[0]):
+        out[fi] = remap[int(labels[fi])]
+    return out
+
+
+def _params_compatible(
+    fa,
+    fb,
+    bbox_diag: float,
+) -> bool:
+    """Check if two fits of the same type have compatible parameters."""
+    if fa.type == PrimitiveType.PLANE:
+        n_a = np.asarray(fa.params["normal"], dtype=np.float64)
+        n_b = np.asarray(fb.params["normal"], dtype=np.float64)
+        cos_angle = abs(float(np.dot(n_a, n_b)))
+        if cos_angle < MERGE_PLANE_NORMAL_COS:
+            return False
+        d_a = float(fa.params["d"])
+        d_b = float(fb.params["d"])
+        # Normals might point in opposite directions; use the sign-corrected
+        # distance difference.
+        if float(np.dot(n_a, n_b)) < 0:
+            d_diff = abs(d_a + d_b)
+        else:
+            d_diff = abs(d_a - d_b)
+        if d_diff / max(bbox_diag, 1e-12) > MERGE_PLANE_D_REL:
+            return False
+        return True
+
+    if fa.type == PrimitiveType.CYLINDER:
+        ax_a = np.asarray(fa.params["axis"], dtype=np.float64)
+        ax_b = np.asarray(fb.params["axis"], dtype=np.float64)
+        if abs(float(np.dot(ax_a, ax_b))) < MERGE_CYL_AXIS_COS:
+            return False
+        r_a = float(fa.params["radius"])
+        r_b = float(fb.params["radius"])
+        if abs(r_a - r_b) / max(r_a, r_b, 1e-12) > MERGE_CYL_RADIUS_REL:
+            return False
+        # Check lateral offset between axes (are they coaxial?).
+        c_a = np.asarray(fa.params["center"], dtype=np.float64)
+        c_b = np.asarray(fb.params["center"], dtype=np.float64)
+        avg_axis = (ax_a + ax_b) / 2.0
+        avg_axis /= max(np.linalg.norm(avg_axis), 1e-12)
+        delta = c_b - c_a
+        lateral = delta - float(np.dot(delta, avg_axis)) * avg_axis
+        if float(np.linalg.norm(lateral)) / max(bbox_diag, 1e-12) > MERGE_CYL_CENTER_REL:
+            return False
+        return True
+
+    if fa.type == PrimitiveType.CONE:
+        ax_a = np.asarray(fa.params["axis"], dtype=np.float64)
+        ax_b = np.asarray(fb.params["axis"], dtype=np.float64)
+        if abs(float(np.dot(ax_a, ax_b))) < MERGE_CYL_AXIS_COS:
+            return False
+        ha_a = float(fa.params["half_angle_deg"])
+        ha_b = float(fb.params["half_angle_deg"])
+        if abs(ha_a - ha_b) > 5.0:  # 5° half-angle tolerance
+            return False
+        return True
+
+    return False
 
 
 def _cylinder_seed_pass(
@@ -818,6 +1087,116 @@ def _face_passes_fit(
         return True
 
     return False
+
+
+def _trim_region_boundaries(
+    labels: np.ndarray,
+    proxy: MeshProxy,
+    bbox_diag: float,
+    reference_scale: float,
+    min_region_faces: int,
+) -> np.ndarray:
+    """Remove the worst-fitting boundary faces from each region.
+
+    For every region with >= min_region_faces faces, this function:
+      1. Fits the region's best primitive (plane/cylinder/cone).
+      2. Computes per-face max-vertex residual against the fit.
+      3. Removes faces whose residual exceeds TRIM_FRAC * the
+         type-appropriate grow tolerance.
+      4. Sets removed faces' labels to -1 (unlabeled).
+
+    The trimmed faces will be picked up by `_absorb_tiny_regions`
+    which merges them into the best-matching neighbor. The net effect
+    is that region boundaries become tighter and the fit quality
+    improves without changing which faces the grower explored.
+
+    Returns a new labels array (mutated in place).
+    """
+    n_labels = int(labels.max()) + 1 if labels.size else 0
+    if n_labels == 0:
+        return labels
+
+    # Per-type trim thresholds, in absolute units.
+    plane_trim = TRIM_FRAC * FIT_PLANE_TOL_REL * bbox_diag
+    cyl_trim = TRIM_FRAC * FIT_CYL_TOL_REL * bbox_diag
+    cone_trim = TRIM_FRAC * FIT_CONE_TOL_REL * bbox_diag
+
+    for r in range(n_labels):
+        region_mask = labels == r
+        n_faces = int(region_mask.sum())
+        if n_faces < min_region_faces:
+            continue
+
+        region_idx = np.where(region_mask)[0].astype(np.int64)
+        vert_idx = np.unique(proxy.faces[region_idx].flatten())
+        pts = proxy.vertices[vert_idx]
+        norms = proxy.face_normals[region_idx]
+
+        if pts.shape[0] < 8:
+            continue
+
+        fit = fit_region(pts, norms, fit_source="trim",
+                         reference_scale=reference_scale)
+
+        # Only trim planes — cylinder and cone regions don't benefit from
+        # boundary trimming (their grow tolerances are already tight and
+        # trimming loses more area than it promotes).
+        if fit.type != PrimitiveType.PLANE:
+            continue
+
+        # Compute per-face max-vertex residual and decide the threshold.
+        if fit.type == PrimitiveType.PLANE:
+            n_vec = np.asarray(fit.params["normal"], dtype=np.float64)
+            d_val = float(fit.params["d"])
+            trim_thr = plane_trim
+            to_drop = []
+            for fi in region_idx:
+                tri = proxy.vertices[proxy.faces[fi]]
+                res = np.abs(tri @ n_vec + d_val)
+                if res.max() > trim_thr:
+                    to_drop.append(fi)
+
+        elif fit.type == PrimitiveType.CYLINDER:
+            axis = np.asarray(fit.params["axis"], dtype=np.float64)
+            center = np.asarray(fit.params["center"], dtype=np.float64)
+            radius = float(fit.params["radius"])
+            trim_thr = cyl_trim
+            to_drop = []
+            for fi in region_idx:
+                tri = proxy.vertices[proxy.faces[fi]]
+                diff = tri - center
+                proj = (diff @ axis)[:, None] * axis
+                radial = np.linalg.norm(diff - proj, axis=1)
+                res = np.abs(radial - radius)
+                if res.max() > trim_thr:
+                    to_drop.append(fi)
+
+        elif fit.type == PrimitiveType.CONE:
+            axis = np.asarray(fit.params["axis"], dtype=np.float64)
+            apex = np.asarray(fit.params["apex"], dtype=np.float64)
+            ha_rad = np.radians(float(fit.params["half_angle_deg"]))
+            sin_a = float(np.sin(ha_rad))
+            cos_a = float(np.cos(ha_rad))
+            trim_thr = cone_trim
+            to_drop = []
+            for fi in region_idx:
+                tri = proxy.vertices[proxy.faces[fi]]
+                diff = tri - apex
+                s_ax = diff @ axis
+                perp = diff - np.outer(s_ax, axis)
+                r_rad = np.linalg.norm(perp, axis=1)
+                res = np.abs(r_rad * cos_a - np.abs(s_ax) * sin_a)
+                if res.max() > trim_thr:
+                    to_drop.append(fi)
+        else:
+            continue
+
+        # Only trim if we're not destroying the region.
+        if len(to_drop) > 0 and (n_faces - len(to_drop)) >= min_region_faces:
+            for fi in to_drop:
+                labels[fi] = -1
+
+    return labels
 
 
 def _absorb_tiny_regions(
