@@ -61,6 +61,20 @@ CYL_SEED_SV1_MIN = 0.20          # sv[1]/sv[0] — span the plane (not all paral
 # huge-radius cylinder.
 CYL_SEED_MAX_RADIUS_FRAC_OF_MESH = 0.50
 
+# Cone-seed signature. Same family as the cylinder signature, but for the
+# *small* circle case: a cone's unit normals lie on a small circle on the
+# unit sphere, so they have both a non-negligible mean (≈ -sin(α)·axis) AND
+# an sv[2]/sv[0] that's small-ish (slightly larger than a cylinder because
+# the circle isn't a geodesic). CONE_SEED_SV2_MAX is deliberately looser
+# than CYL_SEED_SV2_MAX so that partial chamfer cones survive the filter;
+# CONE_SEED_MEAN_NORMAL_MIN is what actually rules cylinders (mean ≈ 0) out.
+FIT_CONE_SEED_MIN_FACES = 16
+FIT_CONE_TOL_REL = 0.018         # max perpendicular residual / bbox for cone grow
+FIT_CONE_NORMAL_ANGLE_DEG = 15.0 # tolerance on |n·axis| - sin(α) alignment check
+CONE_SEED_SV2_MAX = 0.32         # sv[2]/sv[0] — small circle spread, looser than cyl
+CONE_SEED_SV1_MIN = 0.15         # sv[1]/sv[0] — span the circle (not collapsed)
+CONE_SEED_MEAN_NORMAL_MIN = 0.10 # |mean(unit_n)| = sin(α); 0.10 → α ≳ 5.7°
+
 
 def grow_regions(
     proxy: MeshProxy,
@@ -205,8 +219,19 @@ def grow_regions_fit_driven(
 
     plane_tol = FIT_PLANE_TOL_REL * bbox_diag
     cyl_tol = FIT_CYL_TOL_REL * bbox_diag
+    cone_tol = FIT_CONE_TOL_REL * bbox_diag
     cos_plane_normal = float(np.cos(np.radians(FIT_PLANE_NORMAL_DEG)))
     sin_cyl_perp = float(np.sin(np.radians(FIT_CYL_AXIS_PERP_DEG)))
+    cone_normal_sin_tol = float(np.sin(np.radians(FIT_CONE_NORMAL_ANGLE_DEG)))
+
+    grow_kwargs = dict(
+        plane_tol=plane_tol,
+        cyl_tol=cyl_tol,
+        cone_tol=cone_tol,
+        cos_plane_normal=cos_plane_normal,
+        sin_cyl_perp=sin_cyl_perp,
+        cone_normal_sin_tol=cone_normal_sin_tol,
+    )
 
     if progress_callback:
         progress_callback("intent.regions", 5, "Fit-driven: cylinder seed pass...")
@@ -218,17 +243,33 @@ def grow_regions_fit_driven(
         labels,
         cur_label,
         mesh_bbox_diag=bbox_diag,
-        plane_tol=plane_tol,
-        cyl_tol=cyl_tol,
-        cos_plane_normal=cos_plane_normal,
-        sin_cyl_perp=sin_cyl_perp,
+        **grow_kwargs,
+    )
+
+    if progress_callback:
+        progress_callback(
+            "intent.regions",
+            20,
+            f"Cylinder pass: {cur_label} regions; cone seed pass...",
+        )
+
+    # Pass 2: cone-seed scan. Same validate-after-grow discipline as the
+    # cylinder pass; runs AFTER cylinders so that chamfers adjacent to a
+    # through-hole don't accidentally hijack the hole's cylindrical faces.
+    cur_label = _cone_seed_pass(
+        proxy,
+        signals,
+        labels,
+        cur_label,
+        mesh_bbox_diag=bbox_diag,
+        **grow_kwargs,
     )
 
     if progress_callback:
         progress_callback(
             "intent.regions",
             30,
-            f"Cylinder pass: {cur_label} regions; starting plane-dominant pass...",
+            f"Cone pass: {cur_label} regions; starting plane-dominant pass...",
         )
 
     # Pass 2: original area-ordered plane-dominant loop. Seeds: largest
@@ -291,8 +332,10 @@ def grow_regions_fit_driven(
                 proxy,
                 plane_tol=plane_tol,
                 cyl_tol=cyl_tol,
+                cone_tol=cone_tol,
                 cos_plane_normal=cos_plane_normal,
                 sin_cyl_perp=sin_cyl_perp,
+                cone_normal_sin_tol=cone_normal_sin_tol,
             ):
                 continue
             labels[fi] = cur_label
@@ -338,8 +381,10 @@ def _cylinder_seed_pass(
     mesh_bbox_diag: float,
     plane_tol: float,
     cyl_tol: float,
+    cone_tol: float,
     cos_plane_normal: float,
     sin_cyl_perp: float,
+    cone_normal_sin_tol: float,
 ) -> int:
     """Walk unlabeled faces, seed any neighborhood that looks like a
     cylindrical patch, force a cylinder fit, and grow it if the fit
@@ -438,8 +483,10 @@ def _cylinder_seed_pass(
                 proxy,
                 plane_tol=plane_tol,
                 cyl_tol=cyl_tol,
+                cone_tol=cone_tol,
                 cos_plane_normal=cos_plane_normal,
                 sin_cyl_perp=sin_cyl_perp,
+                cone_normal_sin_tol=cone_normal_sin_tol,
             ):
                 continue
             labels[fi] = tentative
@@ -496,6 +543,172 @@ def _cylinder_seed_pass(
     return cur_label
 
 
+def _cone_seed_pass(
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    labels: np.ndarray,
+    cur_label: int,
+    mesh_bbox_diag: float,
+    plane_tol: float,
+    cyl_tol: float,
+    cone_tol: float,
+    cos_plane_normal: float,
+    sin_cyl_perp: float,
+    cone_normal_sin_tol: float,
+) -> int:
+    """Walk unlabeled faces, seed any neighborhood that looks conical,
+    force a cone fit, and grow it if the fit grades HIGH or MEDIUM.
+
+    Mirrors `_cylinder_seed_pass` but uses the cone signature:
+
+        - sv[2]/sv[0] small (normals on a *small* circle on the sphere)
+        - |mean(unit_normals)| ≥ CONE_SEED_MEAN_NORMAL_MIN
+          (this is the `sin(α)` signature that separates a cone from a
+          cylinder — a cylinder has mean(n) ≈ 0)
+
+    Validate-after-grow: the grown region is only committed if the final
+    refit on the entire territory still grades HIGH. Medium-confidence
+    cone seeds that grew by swallowing adjacent near-planar territory get
+    released back to -1 so the plane pass can reclaim them.
+
+    Mutates `labels` in place. Returns the new cur_label.
+    """
+    order = np.argsort(-proxy.face_areas)
+
+    for seed in order:
+        seed = int(seed)
+        if labels[seed] >= 0:
+            continue
+
+        seed_faces = _seed_neighborhood(seed, labels, signals.face_adj, FIT_CONE_SEED_MIN_FACES)
+        if len(seed_faces) < 10:
+            continue  # too small to identify a cone; plane pass handles it
+
+        seed_idx = np.asarray(seed_faces, dtype=np.int64)
+        seed_normals = proxy.face_normals[seed_idx]
+
+        # Normalize for the mean-normal signature to be meaningful.
+        n_len = np.linalg.norm(seed_normals, axis=1)
+        if np.any(n_len < 1e-9):
+            continue
+        unit_n = seed_normals / n_len[:, None]
+
+        mean_n = unit_n.mean(axis=0)
+        mean_n_mag = float(np.linalg.norm(mean_n))
+        if mean_n_mag < CONE_SEED_MEAN_NORMAL_MIN:
+            continue  # cylinder-like (symmetric) or flat — let other passes handle
+
+        nc = unit_n - mean_n
+        try:
+            _, sv, _ = np.linalg.svd(nc, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        if sv[0] < 1e-9:
+            continue
+        sv2_ratio = float(sv[2] / sv[0])
+        sv1_ratio = float(sv[1] / sv[0])
+        if sv2_ratio > CONE_SEED_SV2_MAX:
+            continue  # normals not on a small circle — freeform or noisy
+        if sv1_ratio < CONE_SEED_SV1_MIN:
+            continue  # collapsed circle — effectively a plane
+
+        # Passed the signature. Try a forced cone fit.
+        vert_idx = np.unique(proxy.faces[seed_idx].flatten())
+        pts = proxy.vertices[vert_idx]
+        fit = fit_region(
+            pts,
+            seed_normals,
+            fit_source="cone_seed",
+            forced_type=PrimitiveType.CONE,
+        )
+        if fit.type != PrimitiveType.CONE:
+            continue
+        if fit.confidence_class not in (ConfidenceClass.HIGH, ConfidenceClass.MEDIUM):
+            continue
+
+        tentative = cur_label
+        for f in seed_faces:
+            if labels[f] < 0:
+                labels[f] = tentative
+
+        q: deque = deque()
+        for f in seed_faces:
+            for nb, _ei in signals.face_adj[f]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+        region_face_count = int((labels == tentative).sum())
+        next_refit = max(2 * region_face_count, 60)
+
+        while q:
+            fi = q.popleft()
+            if labels[fi] >= 0:
+                continue
+            if not _face_passes_fit(
+                fi,
+                fit,
+                proxy,
+                plane_tol=plane_tol,
+                cyl_tol=cyl_tol,
+                cone_tol=cone_tol,
+                cos_plane_normal=cos_plane_normal,
+                sin_cyl_perp=sin_cyl_perp,
+                cone_normal_sin_tol=cone_normal_sin_tol,
+            ):
+                continue
+            labels[fi] = tentative
+            region_face_count += 1
+            for nb, _ei in signals.face_adj[fi]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+            if region_face_count >= next_refit:
+                region_idx = np.where(labels == tentative)[0].astype(np.int64)
+                r_verts = np.unique(proxy.faces[region_idx].flatten())
+                refit = fit_region(
+                    proxy.vertices[r_verts],
+                    proxy.face_normals[region_idx],
+                    fit_source="cone_seed_refit",
+                    forced_type=PrimitiveType.CONE,
+                )
+                if (
+                    refit.type == PrimitiveType.CONE
+                    and refit.confidence_class != ConfidenceClass.REJECTED
+                ):
+                    fit = refit
+                next_refit = int(region_face_count * 2)
+
+        # Validate-after-grow: only keep the region if the refit on all
+        # grown faces still grades HIGH. Cones are more ambiguous than
+        # cylinders (the mean-normal signature overlaps with curved fillets
+        # and noisy near-conical freeform patches), so the bar to commit
+        # is deliberately strict.
+        region_mask = labels == tentative
+        n_region = int(region_mask.sum())
+        keep = False
+        if n_region >= 12:
+            region_idx = np.where(region_mask)[0].astype(np.int64)
+            r_verts = np.unique(proxy.faces[region_idx].flatten())
+            final = fit_region(
+                proxy.vertices[r_verts],
+                proxy.face_normals[region_idx],
+                fit_source="cone_seed_final",
+                forced_type=PrimitiveType.CONE,
+            )
+            if (
+                final.type == PrimitiveType.CONE
+                and final.confidence_class == ConfidenceClass.HIGH
+            ):
+                keep = True
+
+        if keep:
+            cur_label += 1
+        else:
+            labels[region_mask] = -1
+
+    return cur_label
+
+
 def _seed_neighborhood(
     seed: int,
     labels: np.ndarray,
@@ -529,8 +742,10 @@ def _face_passes_fit(
     proxy: MeshProxy,
     plane_tol: float,
     cyl_tol: float,
+    cone_tol: float,
     cos_plane_normal: float,
     sin_cyl_perp: float,
+    cone_normal_sin_tol: float,
 ) -> bool:
     """Return True if face `fi` can be absorbed into the current fit.
 
@@ -565,6 +780,29 @@ def _face_passes_fit(
         # on the surface of a cylinder. sin of the angle = |dot(n, axis)|.
         face_normal = proxy.face_normals[fi]
         if abs(float(np.dot(face_normal, axis))) > sin_cyl_perp:
+            return False
+        return True
+
+    if fit.type == PrimitiveType.CONE:
+        axis = np.asarray(fit.params["axis"], dtype=np.float64)
+        apex = np.asarray(fit.params["apex"], dtype=np.float64)
+        half_angle_deg = float(fit.params["half_angle_deg"])
+        half_angle_rad = np.radians(half_angle_deg)
+        sin_a = float(np.sin(half_angle_rad))
+        cos_a = float(np.cos(half_angle_rad))
+        tri = proxy.vertices[proxy.faces[fi]]
+        diff = tri - apex
+        s_axial = diff @ axis
+        perp = diff - np.outer(s_axial, axis)
+        r_radial = np.linalg.norm(perp, axis=1)
+        residuals = np.abs(r_radial * cos_a - np.abs(s_axial) * sin_a)
+        if residuals.max() > cone_tol:
+            return False
+        # Face-normal alignment: on a cone of half-angle α, an outward
+        # unit normal has |n · axis| = sin(α). Tolerance is expressed in
+        # the same "sin of angular deviation" units.
+        face_normal = proxy.face_normals[fi]
+        if abs(abs(float(np.dot(face_normal, axis))) - sin_a) > cone_normal_sin_tol:
             return False
         return True
 

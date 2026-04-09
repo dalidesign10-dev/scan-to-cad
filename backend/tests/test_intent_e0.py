@@ -15,12 +15,15 @@ Cases covered:
     3. partial_cylinder   — a 180° cylindrical arc must be identified as a
                             cylinder, not unknown (catches the normal-SVD
                             axis regression on partial arcs).
-    4. uneven_box         — a single box with an unevenly subdivided face
+    4. partial_cone       — a 270° conical arc strip must be identified as a
+                            cone (catches the mean-normal signature +
+                            5-param linear LS regression; chamfer-like).
+    5. uneven_box         — a single box with an unevenly subdivided face
                             must still resolve to ~6 plane regions, not
                             fragment because the high-density face has more
                             small triangles than the low-density faces.
                             (Catches a region-growing-by-vote regression.)
-    5. force_plane_override — a region fit as UNKNOWN on a curved surface
+    6. force_plane_override — a region fit as UNKNOWN on a curved surface
                             must, after force_plane override, become a
                             plane fit (possibly at LOW / MEDIUM confidence).
                             This is the B2 regression test: the override
@@ -108,6 +111,49 @@ def _partial_cylinder(radius: float = 10.0, height: float = 20.0, arc_deg: float
     return trimesh.Trimesh(vertices=verts, faces=np.asarray(faces, dtype=np.int64), process=True)
 
 
+def _partial_cone(
+    half_angle_deg: float = 30.0,
+    z_lo: float = 2.0,
+    z_hi: float = 10.0,
+    arc_deg: float = 270.0,
+    sections: int = 48,
+    axial_strips: int = 10,
+) -> trimesh.Trimesh:
+    """A conical *arc* strip — no apex cap, no base cap. Stands in for a
+    chamfer (apex below the model) as well as a full cone truncation.
+
+    Apex sits at z=0, axis along +Z, half-angle = `half_angle_deg`. The
+    visible strip spans z in [z_lo, z_hi] and phi in [0, arc_deg]. Using a
+    partial arc is deliberate: CSG chamfers in mechanical parts are almost
+    always only a sector of a full cone, which is also the harder case for
+    the fitter (no azimuthal symmetry to lean on).
+    """
+    alpha = np.radians(half_angle_deg)
+    n_theta = max(6, int(sections * (arc_deg / 360.0)))
+    theta = np.linspace(0.0, np.radians(arc_deg), n_theta)
+    zs = np.linspace(z_lo, z_hi, axial_strips)
+    verts = []
+    for z in zs:
+        r = z * np.tan(alpha)
+        for t in theta:
+            verts.append([r * np.cos(t), r * np.sin(t), z])
+    verts = np.asarray(verts, dtype=np.float64)
+    faces = []
+    for iz in range(len(zs) - 1):
+        for it in range(n_theta - 1):
+            a = iz * n_theta + it
+            b = iz * n_theta + it + 1
+            c = (iz + 1) * n_theta + it
+            d = (iz + 1) * n_theta + it + 1
+            faces.append([a, b, c])
+            faces.append([b, d, c])
+    return trimesh.Trimesh(
+        vertices=verts,
+        faces=np.asarray(faces, dtype=np.int64),
+        process=True,
+    )
+
+
 # ────────────────────────────────────────────────────────────────────
 # Tests
 # ────────────────────────────────────────────────────────────────────
@@ -168,6 +214,56 @@ def test_partial_cylinder_is_cylinder():
     # And zero high plane fits — a half-tube is NOT a plane.
     assert s["n_high_plane_fits"] == 0, (
         f"partial cylinder misclassified {s['n_high_plane_fits']} regions as HIGH plane"
+    )
+
+
+def test_partial_cone_is_cone():
+    """A conical arc strip (partial cone) must land as a CONE fit.
+
+    This is the cone analogue of test_partial_cylinder_is_cylinder — it
+    exists specifically because cones fail very differently from cylinders:
+    a bad cone fitter will either (a) reject everything because the
+    mean-normal signature is rejected, or (b) claim the surface is a
+    slightly-curved cylinder. Both are visible from the region fit types.
+    """
+    cone_mesh = _partial_cone(
+        half_angle_deg=30.0,
+        z_lo=2.0,
+        z_hi=10.0,
+        arc_deg=270.0,
+        sections=64,
+        axial_strips=12,
+    )
+    state = _run(cone_mesh, min_region_faces=8)
+    s = state.summary()
+    any_cone = any(
+        r.fit is not None
+        and r.fit.type == PrimitiveType.CONE
+        and r.fit.confidence_class in (ConfidenceClass.HIGH, ConfidenceClass.MEDIUM)
+        for r in state.regions.values()
+    )
+    assert any_cone, (
+        "partial cone produced no cone fits: "
+        f"{[(r.fit.type.value if r.fit else 'none', r.fit.confidence_class.value if r.fit else '-') for r in state.regions.values()]}"
+    )
+    # Must NOT be misclassified as a plane.
+    assert s["n_high_plane_fits"] == 0, (
+        f"partial cone misclassified as HIGH plane ({s['n_high_plane_fits']} regions)"
+    )
+
+    # And when we check recovered params on the best cone region, the
+    # half-angle should be near the truth (30°). We don't enforce a tight
+    # bound here because synthesized meshes have small bookkeeping drift,
+    # but +/- 5° is easily achievable on a clean synthetic.
+    best_cone = None
+    for r in state.regions.values():
+        if r.fit and r.fit.type == PrimitiveType.CONE:
+            if best_cone is None or r.fit.rmse < best_cone.rmse:
+                best_cone = r.fit
+    assert best_cone is not None
+    half_angle = float(best_cone.params.get("half_angle_deg", 0.0))
+    assert abs(half_angle - 30.0) < 5.0, (
+        f"recovered half_angle={half_angle:.2f}° vs truth 30° (diff > 5°)"
     )
 
 
@@ -492,6 +588,7 @@ ALL_TESTS = [
     ("honest_sphere", test_honest_sphere),
     ("box_plus_boss", test_box_plus_boss_high_fits),
     ("partial_cylinder", test_partial_cylinder_is_cylinder),
+    ("partial_cone", test_partial_cone_is_cone),
     ("uneven_tessellation", test_uneven_tessellation_not_overfragmented),
     ("fandisk_real_mesh", test_fandisk_real_mechanical_mesh),
     ("rocker_arm_freeform", test_rocker_arm_freeform_stays_honest),

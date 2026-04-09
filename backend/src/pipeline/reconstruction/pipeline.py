@@ -270,6 +270,14 @@ def get_intent_overlays(session) -> dict:
                     "radius": fit.params["radius"],
                     "height": fit.params.get("height", 0.0),
                 }
+            elif fit.type == PrimitiveType.CONE:
+                gizmo = {
+                    "kind": "cone_axis",
+                    "origin": fit.params["apex"],
+                    "direction": fit.params["axis"],
+                    "half_angle_deg": fit.params["half_angle_deg"],
+                    "height": fit.params.get("height", 0.0),
+                }
         region_overlays.append({
             "id": r.id,
             "type": ptype,

@@ -35,6 +35,7 @@ import numpy as np
 class PrimitiveType(str, Enum):
     PLANE = "plane"
     CYLINDER = "cylinder"
+    CONE = "cone"
     UNKNOWN = "unknown"
 
 
@@ -211,8 +212,14 @@ class ReconstructionState:
     def summary(self) -> dict:
         n_high_plane = 0
         n_high_cyl = 0
+        n_high_cone = 0
         n_unknown = 0
-        residuals_by_class: Dict[str, List[float]] = {"plane": [], "cylinder": [], "unknown": []}
+        residuals_by_class: Dict[str, List[float]] = {
+            "plane": [],
+            "cylinder": [],
+            "cone": [],
+            "unknown": [],
+        }
         explained_area_high = 0.0
         for r in self.regions.values():
             if r.fit is None:
@@ -229,6 +236,11 @@ class ReconstructionState:
                 if r.fit.confidence_class == ConfidenceClass.HIGH:
                     n_high_cyl += 1
                     explained_area_high += r.area_fraction
+            elif t == PrimitiveType.CONE:
+                residuals_by_class["cone"].append(r.fit.rmse)
+                if r.fit.confidence_class == ConfidenceClass.HIGH:
+                    n_high_cone += 1
+                    explained_area_high += r.area_fraction
             else:
                 n_unknown += 1
                 residuals_by_class["unknown"].append(r.fit.rmse)
@@ -241,9 +253,11 @@ class ReconstructionState:
             "n_boundaries": len(self.boundaries),
             "n_high_plane_fits": int(n_high_plane),
             "n_high_cylinder_fits": int(n_high_cyl),
+            "n_high_cone_fits": int(n_high_cone),
             "n_unknown_regions": int(n_unknown),
             "mean_rmse_plane": _mean(residuals_by_class["plane"]),
             "mean_rmse_cylinder": _mean(residuals_by_class["cylinder"]),
+            "mean_rmse_cone": _mean(residuals_by_class["cone"]),
             "explained_area_high_pct": float(100.0 * explained_area_high),
             "proxy": self.proxy.summary(),
             **self.metrics,

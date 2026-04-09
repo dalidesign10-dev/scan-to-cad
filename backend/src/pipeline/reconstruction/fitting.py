@@ -1,8 +1,9 @@
 """First-pass primitive fitting for the intent layer.
 
-Strict scope for E0:
+Scope for E0:
     - plane
     - cylinder
+    - cone (chamfers on CSG parts)
     - unknown
 
 The fitter is honest:
@@ -10,7 +11,7 @@ The fitter is honest:
     - it grades the fit into a discrete ConfidenceClass
     - if the fit fails any meaningful gate it returns UNKNOWN
 
-We do NOT touch cones, spheres, freeform, fillets, B-splines.
+We do NOT touch spheres, tori (fillets), freeform, B-splines yet.
 
 Scale awareness: every numeric threshold is expressed relative to the
 region's own bbox diagonal, so the same code works on a 10mm boss and a
@@ -41,6 +42,31 @@ CYL_MED_INLIER = 0.55
 # Cylinder rejection gates (independent of confidence class)
 CYL_MIN_RADIUS_REL = 0.02     # smaller radius than 2% of bbox is almost certainly noise-of-a-flat
 CYL_MAX_RADIUS_REL = 8.0      # 8x bbox is the unfit-flat-as-cylinder failure mode
+
+# Cone acceptance gates. Slightly looser than cylinder because the
+# residual depends on two regressed scalars (tan α, z_apex) rather than
+# one radius, so the per-point residual has more degrees of freedom.
+CONE_HIGH_RMSE_REL = 0.012
+CONE_MED_RMSE_REL = 0.030
+CONE_HIGH_INLIER = 0.75
+CONE_MED_INLIER = 0.55
+
+# Cone rejection gates. Half-angle bounds keep the cone distinguishable
+# from a cylinder (too pointy → effectively a cylinder in the limit) and
+# from a plane (too flat → effectively a plane in the limit). Both
+# degenerate cases are better served by the plane/cylinder fitters.
+CONE_MIN_HALF_ANGLE_DEG = 8.0
+CONE_MAX_HALF_ANGLE_DEG = 82.0
+# Mean-normal magnitude signature. On a uniform full cone of half-angle
+# α, |mean(unit_normals)| = sin(α). We need this to be clearly non-zero
+# so we can tell a cone apart from a cylinder (|mean(n)| ≈ 0). The
+# threshold corresponds to α ≳ 3°, which is below the half-angle gate.
+CONE_MIN_MEAN_NORMAL = 0.05
+# Normals of a cone still lie on a small circle in 3D, so the centered
+# normal SVD's smallest singular value must be small compared to the
+# largest — same reasoning as the cylinder coplanarity check, slightly
+# looser because partial cones are narrower circles on the sphere.
+CONE_MAX_NORMAL_SV_RATIO = 0.30
 
 
 def fit_region(
@@ -82,6 +108,12 @@ def fit_region(
                 return _unknown(np.array([]), fit_source, f"forced cylinder rejected: {fit.notes}")
             fit.notes = (fit.notes + " | override:force_cylinder").strip(" |")
             return fit
+        if forced_type == PrimitiveType.CONE:
+            fit = _fit_cone(points, normals, bbox_diag, fit_source)
+            if fit.confidence_class == ConfidenceClass.REJECTED:
+                return _unknown(np.array([]), fit_source, f"forced cone rejected: {fit.notes}")
+            fit.notes = (fit.notes + " | override:force_cone").strip(" |")
+            return fit
         # Anything else (UNKNOWN, future types) falls through to auto-pick.
 
     plane = _fit_plane(points, normals, bbox_diag, fit_source)
@@ -90,8 +122,9 @@ def fit_region(
         return plane
 
     cylinder = _fit_cylinder(points, normals, bbox_diag, fit_source)
+    cone = _fit_cone(points, normals, bbox_diag, fit_source)
 
-    candidates = [c for c in (plane, cylinder) if c is not None]
+    candidates = [c for c in (plane, cylinder, cone) if c is not None]
     candidates = [c for c in candidates if c.confidence_class != ConfidenceClass.REJECTED]
 
     if not candidates:
@@ -269,6 +302,179 @@ def _fit_cylinder(
     )
 
 
+def _fit_cone(
+    points: np.ndarray,
+    normals: Optional[np.ndarray],
+    bbox_diag: float,
+    fit_source: str,
+) -> PrimitiveFit:
+    """Fit a right circular cone to `points` using `normals`.
+
+    The trick that makes cones tractable with the same plumbing as the
+    cylinder fitter is the mean-normal signature:
+
+        for a right circular cone of half-angle α with axis â (pointing
+        apex → base), the outward unit face normals satisfy
+
+            mean(n) = -sin(α) * â
+
+    so |mean(n)| = sin(α) gives a cheap half-angle estimate AND the sign
+    of (-mean(n) · â) tells us which way â must point to reach the apex.
+
+    A cylinder has mean(n) ≈ 0 (normals are symmetric around the axis),
+    which is why CONE_MIN_MEAN_NORMAL is the discriminator between the
+    two. Both have sv[2]/sv[0] small because both live on a circle on
+    the unit sphere (great circle for cylinder, small circle for cone).
+
+    After axis + half-angle, the apex is recovered by a 1D linear fit of
+    radial vs axial coordinate: r(z) = (z - z_apex) * tan(α).
+    """
+    if normals is None or normals.shape[0] < 8:
+        return _rejected(PrimitiveType.CONE, fit_source, "no normals")
+    # Note: points and normals are used independently here (normals for
+    # the mean-normal / SVD signature and axis, points for the linear
+    # apex regression and residuals), so a length mismatch between them
+    # is explicitly OK — pipeline.py passes unique region vertices as
+    # points and per-face normals as normals, and those sizes differ.
+
+    # Work on unit normals — the mean-normal signature is only clean on
+    # the unit sphere, and downstream the magnitude of the mean is
+    # interpreted as sin(α) which only holds if inputs are normalized.
+    n_norms = np.linalg.norm(normals, axis=1)
+    if np.any(n_norms < 1e-9):
+        return _rejected(PrimitiveType.CONE, fit_source, "degenerate normals")
+    unit_normals = normals / n_norms[:, None]
+
+    mean_n = unit_normals.mean(axis=0)
+    mean_n_mag = float(np.linalg.norm(mean_n))
+    if mean_n_mag < CONE_MIN_MEAN_NORMAL:
+        return _rejected(
+            PrimitiveType.CONE,
+            fit_source,
+            f"mean-normal too small ({mean_n_mag:.3f}) — looks like cylinder/plane",
+        )
+
+    nc = unit_normals - mean_n
+    try:
+        _, sv, vh = np.linalg.svd(nc, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return _rejected(PrimitiveType.CONE, fit_source, "SVD failed")
+    if sv[0] < 1e-9:
+        return _rejected(PrimitiveType.CONE, fit_source, "degenerate normal spread")
+
+    sv_ratio = float(sv[2] / sv[0])
+    if sv_ratio > CONE_MAX_NORMAL_SV_RATIO:
+        return _rejected(
+            PrimitiveType.CONE,
+            fit_source,
+            f"normals not on a small circle (sv_ratio={sv_ratio:.2f})",
+        )
+
+    axis = vh[2].astype(np.float64)
+    axis /= max(np.linalg.norm(axis), 1e-12)
+    u_ax = vh[0].astype(np.float64)
+    v_ax = vh[1].astype(np.float64)
+    # Orient axis so that apex→base is positive: since mean(n) = -sin(α)*axis,
+    # we want dot(axis, -mean_n) > 0.
+    if float(np.dot(axis, -mean_n)) < 0:
+        axis = -axis
+
+    centroid = points.mean(axis=0)
+    diff = points - centroid
+    u = diff @ u_ax                 # position in axis-perp plane, first basis
+    v = diff @ v_ax                 # position in axis-perp plane, second basis
+    z = diff @ axis                 # centered axial coordinate
+
+    # Right cone equation expressed in axis-aligned coordinates:
+    #   (u - cu)^2 + (v - cv)^2 = tan²(α) * (z - z_apex)^2
+    # Expanding and regrouping so all five unknowns enter linearly:
+    #   u² + v² = 2*cu*u + 2*cv*v + tan²(α)*z² - 2*tan²(α)*z_apex*z + E
+    # with E = cu² + cv² - tan²(α)*z_apex². Solve A*u + B*v + C*z² + D*z + E
+    # for (A, B, C, D, E) by linear LS — this locates the axis line
+    # (cu, cv), recovers tan²(α) = C, and gives the apex along the axis
+    # as z_apex = -D / (2C). Works for partial cones because nothing here
+    # assumes symmetry in the azimuthal direction.
+    lhs = np.column_stack([u, v, z * z, z, np.ones_like(z)])
+    rhs = u * u + v * v
+    try:
+        sol, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
+    except np.linalg.LinAlgError:
+        return _rejected(PrimitiveType.CONE, fit_source, "cone lstsq failed")
+
+    A, B, C, D, E = (float(s) for s in sol)
+    if C <= 1e-9:
+        return _rejected(
+            PrimitiveType.CONE,
+            fit_source,
+            "non-positive tan²α (degenerate fit)",
+        )
+    tan_a = float(np.sqrt(C))
+    half_angle_rad = float(np.arctan(tan_a))
+    half_angle_deg = float(np.degrees(half_angle_rad))
+    if half_angle_deg < CONE_MIN_HALF_ANGLE_DEG:
+        return _rejected(
+            PrimitiveType.CONE,
+            fit_source,
+            f"half-angle too small ({half_angle_deg:.1f} deg)",
+        )
+    if half_angle_deg > CONE_MAX_HALF_ANGLE_DEG:
+        return _rejected(
+            PrimitiveType.CONE,
+            fit_source,
+            f"half-angle too large ({half_angle_deg:.1f} deg)",
+        )
+
+    cu = A / 2.0
+    cv = B / 2.0
+    z_apex_centered = -D / (2.0 * C)
+    apex = centroid + cu * u_ax + cv * v_ax + z_apex_centered * axis
+
+    # Residual: perpendicular distance from each point to the infinite cone
+    # surface. Work in (axial s, radial r) coordinates from the apex. The
+    # cone line is r = |s| * tan(α); the perpendicular distance from a
+    # point at (s, r) to that line is |r*cos(α) - |s|*sin(α)|. Using |s|
+    # keeps the sign correct when the axis happens to point away from
+    # the base (physical points all land on one nappe, so |s| is the
+    # honest apex→point distance along the axis).
+    diff_apex = points - apex
+    s_axial = diff_apex @ axis
+    perp_vec = diff_apex - np.outer(s_axial, axis)
+    r_radial = np.linalg.norm(perp_vec, axis=1)
+    sin_a = float(np.sin(half_angle_rad))
+    cos_a = float(np.cos(half_angle_rad))
+    residuals = np.abs(r_radial * cos_a - np.abs(s_axial) * sin_a)
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    p95 = float(np.quantile(residuals, 0.95))
+
+    inliers_high = float(np.mean(residuals < max(bbox_diag * CONE_HIGH_RMSE_REL, 1e-9)))
+    inliers_med = float(np.mean(residuals < max(bbox_diag * CONE_MED_RMSE_REL, 1e-9)))
+
+    # Extent along the axis, measured from the apex — used as the
+    # gizmo length and by downstream chamfer heuristics.
+    z_from_apex = np.abs(s_axial)
+    height = float(z_from_apex.max() - z_from_apex.min())
+
+    cls = _grade_cone(rmse, inliers_high, inliers_med, bbox_diag)
+    inliers = inliers_high if cls == ConfidenceClass.HIGH else inliers_med
+    score = _cone_score(rmse, inliers, bbox_diag)
+    return PrimitiveFit(
+        type=PrimitiveType.CONE,
+        params={
+            "apex": apex.tolist(),
+            "axis": axis.tolist(),
+            "half_angle_deg": half_angle_deg,
+            "height": height,
+            "mean_normal_magnitude": mean_n_mag,
+        },
+        rmse=rmse,
+        inlier_ratio=inliers,
+        residual_p95=p95,
+        confidence_class=cls,
+        score=score,
+        fit_source=fit_source,
+    )
+
+
 def _unknown(residuals: np.ndarray, fit_source: str, note: str) -> PrimitiveFit:
     rmse = float(np.sqrt(np.mean(residuals ** 2))) if residuals.size else 0.0
     p95 = float(np.quantile(residuals, 0.95)) if residuals.size else 0.0
@@ -343,4 +549,24 @@ def _plane_score(rmse: float, inliers: float, bbox_diag: float) -> float:
 def _cylinder_score(rmse: float, inliers: float, bbox_diag: float) -> float:
     rel = rmse / max(bbox_diag, 1e-12)
     rmse_score = max(0.0, 1.0 - rel / CYL_MED_RMSE_REL)
+    return float(0.5 * inliers + 0.5 * rmse_score)
+
+
+def _grade_cone(
+    rmse: float,
+    inliers_high: float,
+    inliers_med: float,
+    bbox_diag: float,
+) -> ConfidenceClass:
+    rel = rmse / max(bbox_diag, 1e-12)
+    if rel <= CONE_HIGH_RMSE_REL and inliers_high >= CONE_HIGH_INLIER:
+        return ConfidenceClass.HIGH
+    if rel <= CONE_MED_RMSE_REL and inliers_med >= CONE_MED_INLIER:
+        return ConfidenceClass.MEDIUM
+    return ConfidenceClass.LOW
+
+
+def _cone_score(rmse: float, inliers: float, bbox_diag: float) -> float:
+    rel = rmse / max(bbox_diag, 1e-12)
+    rmse_score = max(0.0, 1.0 - rel / CONE_MED_RMSE_REL)
     return float(0.5 * inliers + 0.5 * rmse_score)
