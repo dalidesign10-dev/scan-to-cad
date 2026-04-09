@@ -36,6 +36,17 @@ PLANE_HIGH_RMSE_REL = 0.005
 PLANE_MED_RMSE_REL = 0.012
 PLANE_HIGH_INLIER = 0.85
 PLANE_MED_INLIER = 0.65
+# Softer HIGH gate when the RMSE is deep within the HIGH band. On scan
+# data the fit-driven grower includes boundary faces with residuals up to
+# FIT_PLANE_TOL_REL (0.8%) — well above the HIGH inlier threshold (0.5%).
+# Those boundary faces lower the HIGH-band inlier ratio below 0.85 even
+# when the fit is objectively excellent (low RMSE, clean surface).
+# When RMSE < 80% of the HIGH threshold, the fit is solidly on the
+# surface and a 70% inlier ratio still means the vast majority of points
+# are close to the plane. This avoids stuck-at-MEDIUM for genuinely flat
+# scan patches with noisy boundary faces.
+PLANE_TIGHT_RMSE_REL = 0.004   # 80% of PLANE_HIGH_RMSE_REL
+PLANE_TIGHT_HIGH_INLIER = 0.70
 
 CYL_HIGH_RMSE_REL = 0.010
 CYL_MED_RMSE_REL = 0.025
@@ -113,11 +124,12 @@ def fit_region(
     # large relative residual → stuck at MEDIUM even when genuinely flat)
     # without turning the whole mesh into "everything looks flat" the way
     # using the raw mesh bbox would (0.5mm RMSE / 300mm mesh = 0.17% →
-    # false HIGH on curved patches). The 10% fraction means a region's
-    # effective scale is never smaller than 1/10 of the mesh, which is
-    # generous enough for 5mm patches on a 300mm scan but still catches
-    # curvature on regions that are >= 10% of the mesh diagonal.
-    _REF_SCALE_FLOOR = 0.10
+    # false HIGH on curved patches). The 15% fraction means a region's
+    # effective scale is never smaller than 15% of the mesh, which is
+    # generous enough for small patches on scans but still catches
+    # curvature on the rocker-arm freeform test. 10% was too tight
+    # (missed half the cone promotions); 20% tripped the rocker arm.
+    _REF_SCALE_FLOOR = 0.15
     if reference_scale is not None and reference_scale > 0:
         bbox_diag = max(region_bbox, reference_scale * _REF_SCALE_FLOOR)
     else:
@@ -548,6 +560,10 @@ def _grade_plane(
     """
     rel = rmse / max(bbox_diag, 1e-12)
     if rel <= PLANE_HIGH_RMSE_REL and inliers_high >= PLANE_HIGH_INLIER:
+        return ConfidenceClass.HIGH
+    # Alternative HIGH gate: when the RMSE is deep within the HIGH band,
+    # accept a softer inlier requirement. See PLANE_TIGHT_RMSE_REL comment.
+    if rel <= PLANE_TIGHT_RMSE_REL and inliers_high >= PLANE_TIGHT_HIGH_INLIER:
         return ConfidenceClass.HIGH
     if rel <= PLANE_MED_RMSE_REL and inliers_med >= PLANE_MED_INLIER:
         return ConfidenceClass.MEDIUM
