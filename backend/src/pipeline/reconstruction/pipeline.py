@@ -209,6 +209,25 @@ def run_intent_segmentation(
         mesh_bbox_diag,
     )
 
+    # Post-expansion refit: regions that lost boundary faces to expansion
+    # may now have a cleaner surface that grades higher.
+    for r_id in list(regions.keys()):
+        r = regions[r_id]
+        if r.fit is None or r.fit.confidence_class == ConfidenceClass.HIGH:
+            continue
+        fi = r.full_face_indices
+        if len(fi) < min_region_faces:
+            continue
+        vert_idx = np.unique(full_faces[fi].flatten())
+        if vert_idx.size < 8:
+            continue
+        pts = full_vertices[vert_idx]
+        norms = full_face_normals[fi]
+        new_fit = fit_region(pts, norms, fit_source="refit_post_expand",
+                             reference_scale=mesh_bbox_diag)
+        if new_fit.confidence_class == ConfidenceClass.HIGH:
+            r.fit = new_fit
+
     metrics = {
         "elapsed_sec": float(time.time() - t0),
         "target_proxy_faces": int(target_proxy),
