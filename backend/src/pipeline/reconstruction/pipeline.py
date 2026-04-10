@@ -676,9 +676,6 @@ def _expand_high_regions(
             tri = full_vertices[full_faces[fi]]
             if np.abs(tri @ n_vec + d_val).max() > accept_thr:
                 continue
-            fn = full_face_normals[fi]
-            if abs(float(np.dot(fn, n_vec))) < 0.94:
-                continue
             absorbed.append(fi)
             region_set.add(fi)
             for nb in face_adj[fi]:
