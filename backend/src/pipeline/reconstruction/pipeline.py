@@ -185,6 +185,19 @@ def run_intent_segmentation(
         # fullres demoted to MEDIUM plane".
         r.fit = refit
 
+    if progress_callback:
+        progress_callback("intent", 93, "Splitting HIGH cores from MEDIUM regions...")
+
+    # Core extraction: for MEDIUM regions, isolate the contiguous subset
+    # of faces whose per-face residuals are within the HIGH band. If the
+    # core is >= 50% of the region and refits as HIGH, split it off as a
+    # new HIGH region. The remaining faces stay in the original region.
+    full_labels, regions = _split_high_cores(
+        full_labels, regions, full_vertices, full_faces,
+        full_face_normals, full_face_areas, total_full_area,
+        mesh_bbox_diag, min_region_faces,
+    )
+
     metrics = {
         "elapsed_sec": float(time.time() - t0),
         "target_proxy_faces": int(target_proxy),
@@ -317,6 +330,190 @@ def _face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     norms = np.linalg.norm(cross, axis=1, keepdims=True)
     return cross / np.maximum(norms, 1e-12)
+
+
+def _split_high_cores(
+    full_labels: np.ndarray,
+    regions: dict,
+    full_vertices: np.ndarray,
+    full_faces: np.ndarray,
+    full_face_normals: np.ndarray,
+    full_face_areas: np.ndarray,
+    total_full_area: float,
+    mesh_bbox_diag: float,
+    min_region_faces: int,
+):
+    """Extract HIGH-quality cores from MEDIUM plane regions.
+
+    For each MEDIUM plane, compute per-face max-vertex residual against
+    the fitted plane. Faces whose residual is within the HIGH band form
+    the "core". If the largest connected component of core faces is big
+    enough and refits as HIGH, split it off as a new region.
+
+    This reclaims area that IS genuinely on the primitive but was stuck
+    in a MEDIUM region because noisy boundary faces inflated the
+    region-wide RMSE.
+    """
+    from .fitting import PLANE_HIGH_RMSE_REL, CYL_HIGH_RMSE_REL, CONE_HIGH_RMSE_REL
+    from collections import deque
+
+    # Build full-mesh face adjacency (edge-sharing).
+    edge_to_faces = {}
+    for fi in range(full_faces.shape[0]):
+        tri = full_faces[fi]
+        for j in range(3):
+            edge = (min(int(tri[j]), int(tri[(j + 1) % 3])),
+                    max(int(tri[j]), int(tri[(j + 1) % 3])))
+            edge_to_faces.setdefault(edge, []).append(fi)
+    face_adj = [[] for _ in range(full_faces.shape[0])]
+    for edge, flist in edge_to_faces.items():
+        for i in range(len(flist)):
+            for j in range(i + 1, len(flist)):
+                face_adj[flist[i]].append(flist[j])
+                face_adj[flist[j]].append(flist[i])
+    del edge_to_faces  # free memory
+
+    next_id = max(regions.keys()) + 1 if regions else 0
+
+    for r_id in list(regions.keys()):
+        r = regions[r_id]
+        if r.fit is None:
+            continue
+        if r.fit.confidence_class != ConfidenceClass.MEDIUM:
+            continue
+        if r.fit.type not in (PrimitiveType.PLANE, PrimitiveType.CYLINDER, PrimitiveType.CONE):
+            continue
+
+        region_bbox = float(np.linalg.norm(
+            np.ptp(full_vertices[np.unique(full_faces[r.full_face_indices].flatten())], axis=0)))
+        eff_bbox = max(region_bbox, mesh_bbox_diag * 0.15)
+
+        # Per-face max-vertex residual against the primitive.
+        core_faces = set()
+        if r.fit.type == PrimitiveType.PLANE:
+            n_vec = np.asarray(r.fit.params["normal"], dtype=np.float64)
+            d_val = float(r.fit.params["d"])
+            high_thr = PLANE_HIGH_RMSE_REL * eff_bbox
+            for fi in r.full_face_indices:
+                tri = full_vertices[full_faces[fi]]
+                if np.abs(tri @ n_vec + d_val).max() <= high_thr:
+                    core_faces.add(int(fi))
+        elif r.fit.type == PrimitiveType.CYLINDER:
+            axis = np.asarray(r.fit.params["axis"], dtype=np.float64)
+            center = np.asarray(r.fit.params["center"], dtype=np.float64)
+            radius = float(r.fit.params["radius"])
+            high_thr = CYL_HIGH_RMSE_REL * eff_bbox
+            for fi in r.full_face_indices:
+                tri = full_vertices[full_faces[fi]]
+                diff = tri - center
+                proj = (diff @ axis)[:, None] * axis
+                radial = np.linalg.norm(diff - proj, axis=1)
+                if np.abs(radial - radius).max() <= high_thr:
+                    core_faces.add(int(fi))
+        elif r.fit.type == PrimitiveType.CONE:
+            axis = np.asarray(r.fit.params["axis"], dtype=np.float64)
+            apex = np.asarray(r.fit.params["apex"], dtype=np.float64)
+            ha_rad = np.radians(float(r.fit.params["half_angle_deg"]))
+            sin_a = float(np.sin(ha_rad))
+            cos_a = float(np.cos(ha_rad))
+            high_thr = CONE_HIGH_RMSE_REL * eff_bbox
+            for fi in r.full_face_indices:
+                tri = full_vertices[full_faces[fi]]
+                diff = tri - apex
+                s_ax = diff @ axis
+                perp = diff - np.outer(s_ax, axis)
+                r_rad = np.linalg.norm(perp, axis=1)
+                if np.abs(r_rad * cos_a - np.abs(s_ax) * sin_a).max() <= high_thr:
+                    core_faces.add(int(fi))
+
+        if len(core_faces) < min_region_faces:
+            continue
+        # The core must be a substantial portion of the original region.
+        # On a genuinely flat surface with noisy boundaries, the core is
+        # 60-80% of the region. On a curved freeform surface, the "flat
+        # center" is typically < 20%. The 40% gate prevents extracting
+        # tiny flat patches from curved surfaces.
+        if len(core_faces) < 0.45 * len(r.full_face_indices):
+            continue
+
+        # Find the largest connected component of core faces.
+        visited = set()
+        best_cc = []
+        for start in core_faces:
+            if start in visited:
+                continue
+            cc = []
+            q = deque([start])
+            visited.add(start)
+            while q:
+                fi = q.popleft()
+                cc.append(fi)
+                for nb in face_adj[fi]:
+                    if nb in visited:
+                        continue
+                    if nb not in core_faces:
+                        continue
+                    visited.add(nb)
+                    q.append(nb)
+            if len(cc) > len(best_cc):
+                best_cc = cc
+
+        if len(best_cc) < min_region_faces:
+            continue
+
+        # Refit the core. If it grades HIGH, split it off.
+        core_idx = np.asarray(best_cc, dtype=np.int64)
+        vert_idx = np.unique(full_faces[core_idx].flatten())
+        if vert_idx.size < 8:
+            continue
+        pts = full_vertices[vert_idx]
+        norms = full_face_normals[core_idx]
+        core_fit = fit_region(pts, norms, fit_source="core_split",
+                              reference_scale=mesh_bbox_diag)
+        if core_fit.confidence_class != ConfidenceClass.HIGH:
+            continue
+
+        # Split: core becomes a new HIGH region, remainder stays MEDIUM.
+        remainder_idx = np.setdiff1d(r.full_face_indices, core_idx)
+        core_area = float(full_face_areas[core_idx].sum())
+        remainder_area = float(full_face_areas[remainder_idx].sum()) if remainder_idx.size > 0 else 0.0
+
+        # Create new region for the core.
+        for fi in core_idx:
+            full_labels[fi] = next_id
+        core_region = Region(
+            id=next_id,
+            proxy_face_indices=r.proxy_face_indices,  # approximate
+            full_face_indices=core_idx,
+            area_full=core_area,
+            area_fraction=core_area / max(total_full_area, 1e-12),
+            fit=core_fit,
+            fit_proxy=r.fit_proxy,
+        )
+        regions[next_id] = core_region
+        next_id += 1
+
+        # Update the original region with the remainder.
+        if remainder_idx.size >= min_region_faces:
+            r.full_face_indices = remainder_idx
+            r.area_full = remainder_area
+            r.area_fraction = remainder_area / max(total_full_area, 1e-12)
+            # Refit the remainder.
+            rem_vert_idx = np.unique(full_faces[remainder_idx].flatten())
+            if rem_vert_idx.size >= 8:
+                rem_pts = full_vertices[rem_vert_idx]
+                rem_norms = full_face_normals[remainder_idx]
+                rem_fit = fit_region(rem_pts, rem_norms, fit_source="core_remainder",
+                                     reference_scale=mesh_bbox_diag)
+                r.fit = rem_fit
+        else:
+            # Remainder too small — absorbed faces stay labeled as orig region.
+            # Mark excluded so it doesn't pollute stats.
+            r.full_face_indices = remainder_idx
+            r.area_full = remainder_area
+            r.area_fraction = remainder_area / max(total_full_area, 1e-12)
+
+    return full_labels, regions
 
 
 def _encode_int32(arr: np.ndarray) -> str:
