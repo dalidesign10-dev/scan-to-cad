@@ -188,6 +188,10 @@ def run_intent_segmentation(
     if progress_callback:
         progress_callback("intent", 93, "Splitting HIGH cores from MEDIUM regions...")
 
+    # Face adjacency is shared across core splitting and every expansion
+    # round — building once saves 8+ rebuilds on large meshes.
+    face_adj = _build_face_adjacency(full_faces)
+
     # Core extraction: for MEDIUM regions, isolate the contiguous subset
     # of faces whose per-face residuals are within the HIGH band. If the
     # core is >= 45% of the region and refits as HIGH, split it off as a
@@ -195,7 +199,7 @@ def run_intent_segmentation(
     full_labels, regions = _split_high_cores(
         full_labels, regions, full_vertices, full_faces,
         full_face_normals, full_face_areas, total_full_area,
-        mesh_bbox_diag, min_region_faces,
+        mesh_bbox_diag, min_region_faces, face_adj,
     )
 
     if progress_callback:
@@ -204,7 +208,7 @@ def run_intent_segmentation(
     # Iterative expand + refit: expansion absorbs boundary faces from
     # MEDIUM into HIGH regions; refit may then promote MEDIUM regions
     # whose surface is now cleaner; those newly-HIGH regions can expand
-    # further in the next round. Cap at 3 rounds to bound runtime.
+    # further in the next round. Cap at 10 rounds to bound runtime.
     for _round in range(10):
         prev_high_area = sum(
             r.area_fraction for r in regions.values()
@@ -214,7 +218,7 @@ def run_intent_segmentation(
         full_labels, regions = _expand_high_regions(
             full_labels, regions, full_vertices, full_faces,
             full_face_normals, full_face_areas, total_full_area,
-            mesh_bbox_diag,
+            mesh_bbox_diag, face_adj,
         )
 
         # Post-expansion refit: regions that lost boundary faces to
@@ -378,6 +382,26 @@ def _face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return cross / np.maximum(norms, 1e-12)
 
 
+def _build_face_adjacency(full_faces: np.ndarray) -> list:
+    """Edge-sharing face adjacency. Built once per pipeline run and
+    shared by core splitting and every expansion round — each rebuild
+    is O(F) and we do 8+ rounds on large meshes, so sharing matters."""
+    edge_to_faces = {}
+    for fi in range(full_faces.shape[0]):
+        tri = full_faces[fi]
+        for j in range(3):
+            edge = (min(int(tri[j]), int(tri[(j + 1) % 3])),
+                    max(int(tri[j]), int(tri[(j + 1) % 3])))
+            edge_to_faces.setdefault(edge, []).append(fi)
+    face_adj = [[] for _ in range(full_faces.shape[0])]
+    for edge, flist in edge_to_faces.items():
+        for i in range(len(flist)):
+            for j in range(i + 1, len(flist)):
+                face_adj[flist[i]].append(flist[j])
+                face_adj[flist[j]].append(flist[i])
+    return face_adj
+
+
 def _split_high_cores(
     full_labels: np.ndarray,
     regions: dict,
@@ -388,6 +412,7 @@ def _split_high_cores(
     total_full_area: float,
     mesh_bbox_diag: float,
     min_region_faces: int,
+    face_adj: list,
 ):
     """Extract HIGH-quality cores from MEDIUM plane regions.
 
@@ -402,22 +427,6 @@ def _split_high_cores(
     """
     from .fitting import PLANE_HIGH_RMSE_REL, CYL_HIGH_RMSE_REL, CONE_HIGH_RMSE_REL
     from collections import deque
-
-    # Build full-mesh face adjacency (edge-sharing).
-    edge_to_faces = {}
-    for fi in range(full_faces.shape[0]):
-        tri = full_faces[fi]
-        for j in range(3):
-            edge = (min(int(tri[j]), int(tri[(j + 1) % 3])),
-                    max(int(tri[j]), int(tri[(j + 1) % 3])))
-            edge_to_faces.setdefault(edge, []).append(fi)
-    face_adj = [[] for _ in range(full_faces.shape[0])]
-    for edge, flist in edge_to_faces.items():
-        for i in range(len(flist)):
-            for j in range(i + 1, len(flist)):
-                face_adj[flist[i]].append(flist[j])
-                face_adj[flist[j]].append(flist[i])
-    del edge_to_faces  # free memory
 
     next_id = max(regions.keys()) + 1 if regions else 0
 
@@ -571,6 +580,7 @@ def _expand_high_regions(
     full_face_areas: np.ndarray,
     total_full_area: float,
     mesh_bbox_diag: float,
+    face_adj: list,
 ):
     """BFS-expand each HIGH region into adjacent non-HIGH faces.
 
@@ -594,22 +604,6 @@ def _expand_high_regions(
         CONE_HIGH_RMSE_REL,
     )
     from collections import deque
-
-    # Build face adjacency once (same construction as _split_high_cores).
-    edge_to_faces = {}
-    for fi in range(full_faces.shape[0]):
-        tri = full_faces[fi]
-        for j in range(3):
-            edge = (min(int(tri[j]), int(tri[(j + 1) % 3])),
-                    max(int(tri[j]), int(tri[(j + 1) % 3])))
-            edge_to_faces.setdefault(edge, []).append(fi)
-    face_adj = [[] for _ in range(full_faces.shape[0])]
-    for edge, flist in edge_to_faces.items():
-        for i in range(len(flist)):
-            for j in range(i + 1, len(flist)):
-                face_adj[flist[i]].append(flist[j])
-                face_adj[flist[j]].append(flist[i])
-    del edge_to_faces
 
     def _commit_absorbed(r_id, r, absorbed, region_set):
         """Update labels and regions after expansion."""
