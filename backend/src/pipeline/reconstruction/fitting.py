@@ -75,8 +75,16 @@ CONE_MED_RMSE_REL = 0.030
 CONE_HIGH_INLIER = 0.75
 CONE_MED_INLIER = 0.55
 # Noise-tolerant cone HIGH gate — same reasoning as PLANE_NOISY_*.
+# Cone inlier threshold is looser (0.70 vs 0.82 for planes) because:
+#   1. Cone residuals (perpendicular to cone surface) are more sensitive
+#      to small axis/half-angle estimation errors than plane residuals
+#   2. Partial cones (chamfers) naturally have boundary transition zones
+#      where the surface blends into adjacent primitives
+#   3. 70% of points within 1.2% of bbox on a cone surface is a strong
+#      positive signal — a freeform surface at rmse_rel=0.018 would have
+#      far fewer inliers within the 1.2% band
 CONE_NOISY_RMSE_REL = 0.018
-CONE_NOISY_HIGH_INLIER = 0.82
+CONE_NOISY_HIGH_INLIER = 0.70
 
 # Cone rejection gates. Half-angle bounds keep the cone distinguishable
 # from a cylinder (too pointy → effectively a cylinder in the limit) and
