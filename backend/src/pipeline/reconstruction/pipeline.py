@@ -205,7 +205,7 @@ def run_intent_segmentation(
     # MEDIUM into HIGH regions; refit may then promote MEDIUM regions
     # whose surface is now cleaner; those newly-HIGH regions can expand
     # further in the next round. Cap at 3 rounds to bound runtime.
-    for _round in range(5):
+    for _round in range(10):
         prev_high_area = sum(
             r.area_fraction for r in regions.values()
             if r.fit is not None and r.fit.confidence_class == ConfidenceClass.HIGH
