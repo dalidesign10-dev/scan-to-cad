@@ -68,7 +68,7 @@ def run_intent_segmentation(
     if full_mesh is None:
         raise ValueError("Run cleanup (Phase A) before intent reconstruction")
 
-    target_proxy = int(params.get("target_proxy_faces", 30000))
+    target_proxy = int(params.get("target_proxy_faces", 40000))
     min_region_faces = int(params.get("min_region_faces", 12))
     growth_mode = str(params.get("growth_mode", "dihedral"))
     if growth_mode not in ("dihedral", "fit_driven"):

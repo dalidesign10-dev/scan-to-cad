@@ -488,8 +488,8 @@ def test_scanned11_fit_driven_segments_primitives():
     area explained in HIGH fits, no mega-region, >=10 HIGH planes,
     AND >=2 HIGH cylinders (the cylinder pass recovers them).
 
-    Observed at this commit: ~29 HIGH planes, 2 HIGH cylinders, ~52%
-    area, max region ~17%.
+    Observed at this commit: ~61 HIGH planes, 3 HIGH cylinders, ~68%
+    area at 40k proxy, max region ~7%.
     """
     scan_path = os.path.join(HERE, "fixtures_local", "scanned11.stl")
     if not os.path.isfile(scan_path):
@@ -498,37 +498,38 @@ def test_scanned11_fit_driven_segments_primitives():
     mesh = trimesh.load(scan_path, force="mesh", process=True)
     state = _run(
         mesh,
-        target_proxy_faces=30000,
+        target_proxy_faces=40000,
         min_region_faces=20,
         growth_mode="fit_driven",
     )
     s = state.summary()
     n_high_plane = s["n_high_plane_fits"]
     n_high_cyl = s["n_high_cylinder_fits"]
-    n_high = n_high_plane + n_high_cyl
+    n_high_cone = s.get("n_high_cone_fits", 0)
+    n_high = n_high_plane + n_high_cyl + n_high_cone
     max_region_frac = max(
         (r.area_fraction for r in state.regions.values()), default=0.0
     )
 
-    # HIGH plane count: the dihedral baseline finds 0. Fit-driven
-    # observed ~29. Floor at 10 to leave headroom for tuning.
-    assert n_high_plane >= 10, (
-        f"scanned11 fit_driven: expected >=10 HIGH planes, got {n_high_plane}"
+    # HIGH plane count: the dihedral baseline finds 0. Fit-driven at
+    # 40k proxy observed ~61. Floor at 20 to leave headroom for tuning.
+    assert n_high_plane >= 20, (
+        f"scanned11 fit_driven: expected >=20 HIGH planes, got {n_high_plane}"
     )
     # HIGH cylinder count: the cylinder-seed pass should recover the
     # cylindrical features that the plane-first loop was swallowing.
-    # Observed: 2. Floor at 2.
+    # Observed: 3. Floor at 2.
     assert n_high_cyl >= 2, (
         f"scanned11 fit_driven: expected >=2 HIGH cylinders, got {n_high_cyl} "
         f"— is the cylinder-seed pass still wired in?"
     )
-    # Total HIGH fits.
-    assert n_high >= 12, (
-        f"scanned11 fit_driven: expected >=12 HIGH fits, got {n_high}"
+    # Total HIGH fits (planes + cylinders + cones).
+    assert n_high >= 40, (
+        f"scanned11 fit_driven: expected >=40 HIGH fits, got {n_high}"
     )
-    # Area explained by HIGH fits: baseline ~1%. Fit-driven observed ~52%.
-    # Floor at 25% to leave headroom for tuning.
-    assert s["explained_area_high_pct"] >= 25.0, (
+    # Area explained by HIGH fits: at 40k proxy observed ~68%.
+    # Floor at 50% to leave headroom for tuning.
+    assert s["explained_area_high_pct"] >= 50.0, (
         f"scanned11 fit_driven: only {s['explained_area_high_pct']:.1f}% "
         f"area explained at HIGH confidence"
     )
