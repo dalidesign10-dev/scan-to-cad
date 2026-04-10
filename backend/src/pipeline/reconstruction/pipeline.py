@@ -190,12 +190,23 @@ def run_intent_segmentation(
 
     # Core extraction: for MEDIUM regions, isolate the contiguous subset
     # of faces whose per-face residuals are within the HIGH band. If the
-    # core is >= 50% of the region and refits as HIGH, split it off as a
+    # core is >= 45% of the region and refits as HIGH, split it off as a
     # new HIGH region. The remaining faces stay in the original region.
     full_labels, regions = _split_high_cores(
         full_labels, regions, full_vertices, full_faces,
         full_face_normals, full_face_areas, total_full_area,
         mesh_bbox_diag, min_region_faces,
+    )
+
+    if progress_callback:
+        progress_callback("intent", 96, "Expanding HIGH regions...")
+
+    # Grow HIGH regions outward by absorbing adjacent faces from
+    # MEDIUM/UNKNOWN regions that pass the HIGH primitive's fit test.
+    full_labels, regions = _expand_high_regions(
+        full_labels, regions, full_vertices, full_faces,
+        full_face_normals, full_face_areas, total_full_area,
+        mesh_bbox_diag,
     )
 
     metrics = {
@@ -512,6 +523,130 @@ def _split_high_cores(
             r.full_face_indices = remainder_idx
             r.area_full = remainder_area
             r.area_fraction = remainder_area / max(total_full_area, 1e-12)
+
+    return full_labels, regions
+
+
+def _expand_high_regions(
+    full_labels: np.ndarray,
+    regions: dict,
+    full_vertices: np.ndarray,
+    full_faces: np.ndarray,
+    full_face_normals: np.ndarray,
+    full_face_areas: np.ndarray,
+    total_full_area: float,
+    mesh_bbox_diag: float,
+):
+    """BFS-expand each HIGH region into adjacent non-HIGH faces.
+
+    For each HIGH region, try to absorb neighbouring faces from MEDIUM
+    or UNKNOWN regions whose max-vertex residual against the HIGH
+    primitive is within the HIGH threshold. The expansion stops when
+    no more adjacent faces pass the fit test.
+
+    After expansion, the HIGH region is refitted. If it drops below
+    HIGH, the expansion is rolled back. Only plane expansions are
+    attempted (cylinder/cone have tighter geometry and expansion is
+    less likely to help).
+    """
+    from .fitting import PLANE_HIGH_RMSE_REL
+    from collections import deque
+
+    # Build face adjacency once (same construction as _split_high_cores).
+    edge_to_faces = {}
+    for fi in range(full_faces.shape[0]):
+        tri = full_faces[fi]
+        for j in range(3):
+            edge = (min(int(tri[j]), int(tri[(j + 1) % 3])),
+                    max(int(tri[j]), int(tri[(j + 1) % 3])))
+            edge_to_faces.setdefault(edge, []).append(fi)
+    face_adj = [[] for _ in range(full_faces.shape[0])]
+    for edge, flist in edge_to_faces.items():
+        for i in range(len(flist)):
+            for j in range(i + 1, len(flist)):
+                face_adj[flist[i]].append(flist[j])
+                face_adj[flist[j]].append(flist[i])
+    del edge_to_faces
+
+    for r_id in list(regions.keys()):
+        r = regions[r_id]
+        if r.fit is None or r.fit.confidence_class != ConfidenceClass.HIGH:
+            continue
+        if r.fit.type != PrimitiveType.PLANE:
+            continue
+
+        n_vec = np.asarray(r.fit.params["normal"], dtype=np.float64)
+        d_val = float(r.fit.params["d"])
+        region_bbox = float(np.linalg.norm(
+            np.ptp(full_vertices[np.unique(full_faces[r.full_face_indices].flatten())], axis=0)))
+        eff_bbox = max(region_bbox, mesh_bbox_diag * 0.15)
+        high_thr = PLANE_HIGH_RMSE_REL * eff_bbox
+
+        # BFS from the region boundary into adjacent non-HIGH faces.
+        region_set = set(r.full_face_indices.tolist())
+        absorbed = []
+        # Seed the BFS with faces adjacent to the region boundary.
+        q = deque()
+        visited = set(region_set)
+        for fi in r.full_face_indices:
+            for nb in face_adj[int(fi)]:
+                if nb not in visited:
+                    visited.add(nb)
+                    q.append(nb)
+
+        while q:
+            fi = q.popleft()
+            # Only absorb from non-HIGH regions.
+            src_region = int(full_labels[fi])
+            if src_region in regions and regions[src_region].fit is not None:
+                if regions[src_region].fit.confidence_class == ConfidenceClass.HIGH:
+                    continue
+            # Check residual.
+            tri = full_vertices[full_faces[fi]]
+            if np.abs(tri @ n_vec + d_val).max() > high_thr:
+                continue
+            # Check face normal alignment.
+            fn = full_face_normals[fi]
+            if abs(float(np.dot(fn, n_vec))) < 0.94:  # ~20° tolerance
+                continue
+            absorbed.append(fi)
+            region_set.add(fi)
+            for nb in face_adj[fi]:
+                if nb not in visited:
+                    visited.add(nb)
+                    q.append(nb)
+
+        if not absorbed:
+            continue
+
+        # Validate: refit the expanded region and check it's still HIGH.
+        new_faces = np.asarray(sorted(region_set), dtype=np.int64)
+        vert_idx = np.unique(full_faces[new_faces].flatten())
+        if vert_idx.size < 8:
+            continue
+        pts = full_vertices[vert_idx]
+        norms = full_face_normals[new_faces]
+        new_fit = fit_region(pts, norms, fit_source="expand",
+                             reference_scale=mesh_bbox_diag)
+        if new_fit.confidence_class != ConfidenceClass.HIGH:
+            continue  # roll back — don't absorb
+
+        # Commit: update labels and region.
+        for fi in absorbed:
+            old_region = int(full_labels[fi])
+            full_labels[fi] = r_id
+            # Shrink the source region.
+            if old_region in regions:
+                src = regions[old_region]
+                mask = src.full_face_indices != fi
+                src.full_face_indices = src.full_face_indices[mask]
+                src.area_full -= float(full_face_areas[fi])
+                src.area_fraction = src.area_full / max(total_full_area, 1e-12)
+
+        r.full_face_indices = new_faces
+        r.area_full = float(full_face_areas[new_faces].sum())
+        r.area_fraction = r.area_full / max(total_full_area, 1e-12)
+        r.fit = new_fit
 
     return full_labels, regions
 
