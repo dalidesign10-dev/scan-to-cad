@@ -201,32 +201,48 @@ def run_intent_segmentation(
     if progress_callback:
         progress_callback("intent", 96, "Expanding HIGH regions...")
 
-    # Grow HIGH regions outward by absorbing adjacent faces from
-    # MEDIUM/UNKNOWN regions that pass the HIGH primitive's fit test.
-    full_labels, regions = _expand_high_regions(
-        full_labels, regions, full_vertices, full_faces,
-        full_face_normals, full_face_areas, total_full_area,
-        mesh_bbox_diag,
-    )
+    # Iterative expand + refit: expansion absorbs boundary faces from
+    # MEDIUM into HIGH regions; refit may then promote MEDIUM regions
+    # whose surface is now cleaner; those newly-HIGH regions can expand
+    # further in the next round. Cap at 3 rounds to bound runtime.
+    for _round in range(3):
+        prev_high_area = sum(
+            r.area_fraction for r in regions.values()
+            if r.fit is not None and r.fit.confidence_class == ConfidenceClass.HIGH
+        )
 
-    # Post-expansion refit: regions that lost boundary faces to expansion
-    # may now have a cleaner surface that grades higher.
-    for r_id in list(regions.keys()):
-        r = regions[r_id]
-        if r.fit is None or r.fit.confidence_class == ConfidenceClass.HIGH:
-            continue
-        fi = r.full_face_indices
-        if len(fi) < min_region_faces:
-            continue
-        vert_idx = np.unique(full_faces[fi].flatten())
-        if vert_idx.size < 8:
-            continue
-        pts = full_vertices[vert_idx]
-        norms = full_face_normals[fi]
-        new_fit = fit_region(pts, norms, fit_source="refit_post_expand",
-                             reference_scale=mesh_bbox_diag)
-        if new_fit.confidence_class == ConfidenceClass.HIGH:
-            r.fit = new_fit
+        full_labels, regions = _expand_high_regions(
+            full_labels, regions, full_vertices, full_faces,
+            full_face_normals, full_face_areas, total_full_area,
+            mesh_bbox_diag,
+        )
+
+        # Post-expansion refit: regions that lost boundary faces to
+        # expansion may now have a cleaner surface that grades higher.
+        for r_id in list(regions.keys()):
+            r = regions[r_id]
+            if r.fit is None or r.fit.confidence_class == ConfidenceClass.HIGH:
+                continue
+            fi = r.full_face_indices
+            if len(fi) < min_region_faces:
+                continue
+            vert_idx = np.unique(full_faces[fi].flatten())
+            if vert_idx.size < 8:
+                continue
+            pts = full_vertices[vert_idx]
+            norms = full_face_normals[fi]
+            new_fit = fit_region(pts, norms, fit_source="refit_post_expand",
+                                 reference_scale=mesh_bbox_diag)
+            if new_fit.confidence_class == ConfidenceClass.HIGH:
+                r.fit = new_fit
+
+        new_high_area = sum(
+            r.area_fraction for r in regions.values()
+            if r.fit is not None and r.fit.confidence_class == ConfidenceClass.HIGH
+        )
+        # Stop if this round gained less than 0.1pp.
+        if new_high_area - prev_high_area < 0.001:
+            break
 
     metrics = {
         "elapsed_sec": float(time.time() - t0),
