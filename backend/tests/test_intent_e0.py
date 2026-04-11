@@ -358,6 +358,37 @@ def test_surface_family_grouping_on_cube():
             f"region {r.id} has no surface_family_id (pass left -1)"
         )
 
+    # SurfaceFamily objects must exist for every HIGH fit and only for
+    # HIGH fits. The canonical params must come from the largest-area
+    # member — this lets downstream CAD consumers use ONE primitive per
+    # surface without inspecting individual region fits.
+    high_fids = {
+        r.surface_family_id for r in state.regions.values()
+        if r.fit and r.fit.confidence_class == ConfidenceClass.HIGH
+        and r.fit.type != PrimitiveType.UNKNOWN
+    }
+    assert set(state.surface_families.keys()) == high_fids, (
+        f"surface_families mismatch: "
+        f"families={sorted(state.surface_families.keys())} vs "
+        f"expected={sorted(high_fids)}"
+    )
+    # Each SurfaceFamily's representative must be the member with the
+    # largest area_fraction, and its canonical params must match the
+    # representative's fit params exactly.
+    for fid, fam in state.surface_families.items():
+        members = [state.regions[rid] for rid in fam.region_ids]
+        assert members, f"family {fid} has no members"
+        largest = max(members, key=lambda r: r.area_fraction)
+        assert fam.representative_region_id == largest.id, (
+            f"family {fid}: rep={fam.representative_region_id} "
+            f"but largest member is {largest.id}"
+        )
+        assert fam.type == largest.fit.type
+        # Params are a dict clone, so they compare equal but are NOT the
+        # same object (mutating one must not affect the other).
+        assert fam.canonical_params == largest.fit.params
+        assert fam.canonical_params is not largest.fit.params
+
 
 def test_force_plane_override_takes_effect():
     """The force_plane override must actually change a region's fit.

@@ -200,6 +200,41 @@ class Constraint:
 
 
 @dataclass
+class SurfaceFamily:
+    """A canonical analytic surface that one or more Regions belong to.
+
+    Where a Region is a connected set of mesh faces, a SurfaceFamily is
+    the underlying primitive equation. Two physically separate pads on
+    the same plane are two Regions in one SurfaceFamily; a single hole
+    piercing a single boss is usually one Region in one SurfaceFamily.
+
+    `canonical_params` is the representative primitive equation chosen
+    from the member regions — by convention the largest-area member
+    wins, so the canonical params are the best-supported estimate
+    available. Per-region fits are left untouched; this object lives
+    beside them as a higher-level CAD-ready view.
+    """
+    id: int
+    type: PrimitiveType
+    region_ids: List[int]
+    canonical_params: Dict
+    total_area: float                  # sum of area_full over members
+    total_area_fraction: float         # sum of area_fraction over members
+    representative_region_id: int      # the member whose params we cloned
+
+    def to_dict(self) -> dict:
+        return {
+            "id": int(self.id),
+            "type": self.type.value,
+            "region_ids": [int(r) for r in self.region_ids],
+            "canonical_params": _coerce_jsonable(self.canonical_params),
+            "total_area": float(self.total_area),
+            "total_area_fraction": float(self.total_area_fraction),
+            "representative_region_id": int(self.representative_region_id),
+        }
+
+
+@dataclass
 class ReconstructionState:
     """Top-level intent reconstruction state.
 
@@ -211,6 +246,7 @@ class ReconstructionState:
     regions: Dict[int, Region] = field(default_factory=dict)
     boundaries: List[Boundary] = field(default_factory=list)
     constraints: List[Constraint] = field(default_factory=list)
+    surface_families: Dict[int, "SurfaceFamily"] = field(default_factory=dict)
     # Optional cached arrays for the overlays endpoint:
     proxy_edge_confidence: Optional[np.ndarray] = None    # (E,) float in [0,1]
     proxy_edge_endpoints: Optional[np.ndarray] = None     # (E, 2, 3) float
@@ -303,6 +339,9 @@ class ReconstructionState:
         if include_regions:
             out["regions"] = [r.to_dict() for r in sorted(self.regions.values(), key=lambda r: r.id)]
             out["boundaries"] = [b.to_dict() for b in self.boundaries]
+            out["surface_families"] = [
+                f.to_dict() for f in sorted(self.surface_families.values(), key=lambda f: f.id)
+            ]
         return out
 
 

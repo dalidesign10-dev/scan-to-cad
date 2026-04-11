@@ -38,6 +38,7 @@ from .state import (
     PrimitiveFit,
     PrimitiveType,
     ConfidenceClass,
+    SurfaceFamily,
 )
 from .proxy_mesh import build_proxy_mesh, transfer_labels_to_full
 from .boundary import compute_boundary_signals
@@ -252,6 +253,7 @@ def run_intent_segmentation(
         progress_callback("intent", 98, "Grouping HIGH fits into surface families...")
 
     _assign_surface_families(regions, mesh_bbox_diag)
+    surface_families = _build_surface_families(regions)
 
     metrics = {
         "elapsed_sec": float(time.time() - t0),
@@ -265,6 +267,7 @@ def run_intent_segmentation(
         proxy=proxy,
         regions=regions,
         boundaries=boundaries,
+        surface_families=surface_families,
         proxy_edge_confidence=signals.confidence,
         proxy_edge_endpoints=proxy.vertices[signals.edge_vertex_pairs],
         full_face_region=full_labels.astype(np.int64),
@@ -511,6 +514,47 @@ def _assign_surface_families(regions: dict, mesh_bbox_diag: float) -> None:
         if r.surface_family_id < 0:
             r.surface_family_id = next_family_id
             next_family_id += 1
+
+
+def _build_surface_families(regions: dict) -> dict:
+    """Construct one SurfaceFamily per distinct surface_family_id.
+
+    Only HIGH-fit families get a canonical primitive — non-HIGH regions
+    get singleton family ids but no SurfaceFamily object (they have no
+    reliable analytic params to promote). The canonical params are
+    cloned from the LARGEST-area member, which is the most trusted fit
+    in the family (more points, less boundary noise).
+
+    Returns a dict keyed by family_id; callers hand it straight to
+    ReconstructionState.surface_families.
+    """
+    by_fid: dict = {}
+    for r in regions.values():
+        if r.fit is None or r.fit.confidence_class != ConfidenceClass.HIGH:
+            continue
+        if r.fit.type == PrimitiveType.UNKNOWN:
+            continue
+        fid = int(r.surface_family_id)
+        by_fid.setdefault(fid, []).append(r)
+
+    families = {}
+    for fid, members in by_fid.items():
+        # Representative: the member with the largest area_fraction.
+        rep = max(members, key=lambda r: r.area_fraction)
+        total_area = float(sum(m.area_full for m in members))
+        total_area_fraction = float(sum(m.area_fraction for m in members))
+        families[fid] = SurfaceFamily(
+            id=fid,
+            type=rep.fit.type,
+            region_ids=[int(m.id) for m in sorted(members, key=lambda r: r.id)],
+            # Clone the params so later mutation of rep.fit.params doesn't
+            # leak into the canonical family view.
+            canonical_params=dict(rep.fit.params),
+            total_area=total_area,
+            total_area_fraction=total_area_fraction,
+            representative_region_id=int(rep.id),
+        )
+    return families
 
 
 def _build_face_adjacency(full_faces: np.ndarray) -> list:
