@@ -132,9 +132,9 @@ export function PipelinePanel() {
   const [angleThresh, setAngleThresh] = useState(60)
   const [poissonDepth, setPoissonDepth] = useState(10)
   const [sampleCount, setSampleCount] = useState(400000)
-  const [intentTargetFaces, setIntentTargetFaces] = useState(30000)
-  const [intentMinRegionFaces, setIntentMinRegionFaces] = useState(12)
-  const [intentGrowthMode, setIntentGrowthMode] = useState<'dihedral' | 'fit_driven'>('dihedral')
+  const [intentTargetFaces, setIntentTargetFaces] = useState(40000)
+  const [intentMinRegionFaces, setIntentMinRegionFaces] = useState(20)
+  const [intentGrowthMode, setIntentGrowthMode] = useState<'dihedral' | 'fit_driven'>('fit_driven')
   const [showCleanupAdv, setShowCleanupAdv] = useState(false)
   const [cageMinInlier, setCageMinInlier] = useState(0.85)
   const [cagePlaneAngle, setCagePlaneAngle] = useState(5)
@@ -274,17 +274,19 @@ export function PipelinePanel() {
             <div>
               <span style={{ color: '#4ecca3' }}>{intentSummary.n_high_plane_fits}</span> high planes,
               {' '}<span style={{ color: '#e94560' }}>{intentSummary.n_high_cylinder_fits}</span> high cyl,
+              {' '}<span style={{ color: '#f39c12' }}>{intentSummary.n_high_cone_fits ?? 0}</span> high cone,
               {' '}<span style={{ color: '#888' }}>{intentSummary.n_unknown_regions}</span> unknown
             </div>
             <div>
               area-explained:
-              {' '}<span style={{ color: '#feca57' }}>
+              {' '}<span style={{ color: '#feca57', fontWeight: 'bold' }}>
                 {(intentSummary.explained_area_high_pct ?? 0).toFixed(1)}%
               </span>
             </div>
             <div style={{ color: '#666' }}>
               rmse plane {intentSummary.mean_rmse_plane?.toFixed(3) ?? '0'} ·
               cyl {intentSummary.mean_rmse_cylinder?.toFixed(3) ?? '0'} ·
+              cone {intentSummary.mean_rmse_cone?.toFixed(3) ?? '0'} ·
               {' '}{(intentSummary.elapsed_sec ?? 0).toFixed(1)}s
             </div>
             <div style={{ color: '#666' }}>

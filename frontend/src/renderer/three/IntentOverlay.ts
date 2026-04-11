@@ -17,18 +17,19 @@ import * as THREE from 'three'
 
 export interface IntentRegionInfo {
   id: number
-  type: 'plane' | 'cylinder' | 'unknown'
+  type: 'plane' | 'cylinder' | 'cone' | 'unknown'
   confidence_class: 'high' | 'medium' | 'low' | 'rejected'
   score: number
   rmse: number
   n_full_faces: number
   area_fraction: number
   gizmo: null | {
-    kind: 'plane_normal' | 'cylinder_axis'
+    kind: 'plane_normal' | 'cylinder_axis' | 'cone_axis'
     origin: number[]
     direction: number[]
     radius?: number
     height?: number
+    half_angle?: number
   }
 }
 
@@ -56,6 +57,10 @@ const COLOR_CYL_HIGH = new THREE.Color(0xe94560)
 const COLOR_CYL_MED = new THREE.Color(0xa53344)
 const COLOR_CYL_LOW = new THREE.Color(0x66222a)
 
+const COLOR_CONE_HIGH = new THREE.Color(0xf39c12)
+const COLOR_CONE_MED = new THREE.Color(0xa8690a)
+const COLOR_CONE_LOW = new THREE.Color(0x553306)
+
 const COLOR_UNKNOWN = new THREE.Color(0x666677)
 const COLOR_REJECTED = new THREE.Color(0x333344)
 
@@ -69,6 +74,11 @@ function colorForRegion(r: IntentRegionInfo): THREE.Color {
     if (r.confidence_class === 'high') return COLOR_CYL_HIGH
     if (r.confidence_class === 'medium') return COLOR_CYL_MED
     return COLOR_CYL_LOW
+  }
+  if (r.type === 'cone') {
+    if (r.confidence_class === 'high') return COLOR_CONE_HIGH
+    if (r.confidence_class === 'medium') return COLOR_CONE_MED
+    return COLOR_CONE_LOW
   }
   if (r.confidence_class === 'rejected') return COLOR_REJECTED
   return COLOR_UNKNOWN
@@ -170,6 +180,18 @@ export function renderIntentGizmos(
     } else if (r.gizmo.kind === 'cylinder_axis') {
       const a = o.clone().addScaledVector(d, -cylLen * 0.5)
       const b = o.clone().addScaledVector(d, cylLen * 0.5)
+      const geom = new THREE.BufferGeometry().setFromPoints([a, b])
+      const mat = new THREE.LineBasicMaterial({
+        color: colorForRegion(r),
+        depthTest: true,
+      })
+      group.add(new THREE.Line(geom, mat))
+    } else if (r.gizmo.kind === 'cone_axis') {
+      // Cone axis: same visual as cylinder axis but with a slightly
+      // shorter line so the two classes can be told apart when they
+      // sit near each other in the viewport.
+      const a = o.clone().addScaledVector(d, -cylLen * 0.35)
+      const b = o.clone().addScaledVector(d, cylLen * 0.35)
       const geom = new THREE.BufferGeometry().setFromPoints([a, b])
       const mat = new THREE.LineBasicMaterial({
         color: colorForRegion(r),
