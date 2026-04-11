@@ -14,6 +14,7 @@ import {
   applyIntentRegionColors,
   renderIntentGizmos,
   renderIntentSharpEdges,
+  renderIntentFamilyEdges,
   clearIntentGizmos,
 } from './IntentOverlay'
 import type { PrimitiveResult } from '../store/pipelineStore'
@@ -313,6 +314,7 @@ export class SceneManager {
     }
     renderIntentGizmos(this.intentGizmoGroup, payload, scale, this.intentColorMode)
     renderIntentSharpEdges(this.intentGizmoGroup, payload)
+    renderIntentFamilyEdges(this.intentGizmoGroup, payload)
     if (this.intentRegionColorsActive && this.currentMesh) {
       applyIntentRegionColors(this.currentMesh, payload, this.intentColorMode)
     }
@@ -341,6 +343,7 @@ export class SceneManager {
     }
     renderIntentGizmos(this.intentGizmoGroup, this.currentIntentPayload, scale, mode)
     renderIntentSharpEdges(this.intentGizmoGroup, this.currentIntentPayload)
+    renderIntentFamilyEdges(this.intentGizmoGroup, this.currentIntentPayload)
     if (this.intentRegionColorsActive && this.currentMesh) {
       applyIntentRegionColors(this.currentMesh, this.currentIntentPayload, mode)
     }

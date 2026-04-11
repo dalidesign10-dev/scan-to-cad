@@ -54,12 +54,30 @@ export interface IntentSharpEdges {
   n: number
 }
 
+/**
+ * Analytic intersection between two SurfaceFamilies — currently only
+ * plane/plane (a line segment clipped to the mesh AABB), but the
+ * shape is forward-compatible with sampled curves (polyline) so
+ * plane/cylinder etc. can land without schema churn.
+ */
+export interface IntentFamilyEdge {
+  family_a: number
+  family_b: number
+  type_a: 'plane' | 'cylinder' | 'cone' | 'unknown'
+  type_b: 'plane' | 'cylinder' | 'cone' | 'unknown'
+  kind: string  // e.g. "plane_plane"
+  points: number[][]  // polyline, length ≥ 2
+  n_points: number
+  n_supporting_boundaries: number
+}
+
 export interface IntentOverlayPayload {
   available: boolean
   n_full_faces: number
   full_face_region_b64: string | null
   regions: IntentRegionInfo[]
   surface_families?: IntentSurfaceFamilyInfo[]
+  family_edges?: IntentFamilyEdge[]
   sharp_edges: IntentSharpEdges | null
   summary: any
 }
@@ -341,5 +359,57 @@ export function renderIntentSharpEdges(
   const mat = new THREE.LineBasicMaterial({ vertexColors: true, depthTest: false })
   const lines = new THREE.LineSegments(geom, mat)
   lines.renderOrder = 998
+  group.add(lines)
+}
+
+/**
+ * Render family-level analytic intersection edges (plane/plane lines
+ * clipped to the mesh AABB). These are the "ideal" B-Rep edges implied
+ * by the current family set — they do not depend on per-region sharp
+ * detection, so they stay clean even on noisy scans.
+ *
+ * Cyan so they're distinguishable from the amber sharp-edge overlay
+ * and the region-level gizmo lines.
+ */
+const COLOR_FAMILY_EDGE = new THREE.Color(0x48dbfb)
+export function renderIntentFamilyEdges(
+  group: THREE.Group,
+  payload: IntentOverlayPayload,
+) {
+  const fe = payload.family_edges
+  if (!fe || fe.length === 0) return
+  // All family edges are drawn in one batched LineSegments. Each
+  // polyline of N points contributes (N-1) segments, so we first
+  // count segments to size the buffer.
+  let nSeg = 0
+  for (const e of fe) if (e.n_points >= 2) nSeg += (e.n_points - 1)
+  if (nSeg === 0) return
+  const positions = new Float32Array(nSeg * 6)
+  let write = 0
+  for (const e of fe) {
+    if (e.n_points < 2) continue
+    for (let i = 0; i < e.n_points - 1; i++) {
+      const a = e.points[i]
+      const b = e.points[i + 1]
+      positions[write++] = a[0]
+      positions[write++] = a[1]
+      positions[write++] = a[2]
+      positions[write++] = b[0]
+      positions[write++] = b[1]
+      positions[write++] = b[2]
+    }
+  }
+  const geom = new THREE.BufferGeometry()
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  const mat = new THREE.LineBasicMaterial({
+    color: COLOR_FAMILY_EDGE,
+    transparent: true,
+    opacity: 0.9,
+    depthTest: false,
+  })
+  const lines = new THREE.LineSegments(geom, mat)
+  // Slightly above the sharp-edge overlay so the clean analytic
+  // lines aren't hidden by noisy sharp-edge clusters.
+  lines.renderOrder = 999
   group.add(lines)
 }

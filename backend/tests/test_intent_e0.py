@@ -390,6 +390,106 @@ def test_surface_family_grouping_on_cube():
         assert fam.canonical_params is not largest.fit.params
 
 
+def test_family_plane_intersections_on_cube():
+    """Plane/plane family intersections on a stepped cube must match
+    real B-Rep edges of the part.
+
+    Same fixture as the grouping test. After a full pipeline run, the
+    `intent_edges` list on the ReconstructionState should contain:
+      - One edge per pair of adjacent plane families that share a
+        sharp boundary (the 12 side-vs-top/bottom edges of the outer
+        box + the 4 side-vs-top edges of the inner platform, modulo
+        family grouping).
+      - Each edge is a length-2 polyline (a clipped line segment)
+        that lies within the mesh AABB + small pad.
+      - The line's DIRECTION is perpendicular to both parent family
+        normals (that's the defining property of a plane/plane line).
+      - Every edge's (family_a, family_b) pair is backed by at least
+        one sharp boundary between members of those families.
+    """
+    outer = _dense_box((80.0, 80.0, 20.0), subdivisions=2)
+    inner = _dense_box((30.0, 30.0, 5.0), subdivisions=1)
+    inner.apply_translation([0.0, 0.0, 12.5])
+    mesh = trimesh.util.concatenate([outer, inner])
+    state = _run(mesh)
+
+    edges = state.intent_edges
+    assert isinstance(edges, list)
+    assert len(edges) >= 4, (
+        f"expected ≥4 family-level intersection edges on stepped box, got {len(edges)}"
+    )
+
+    # Bbox that every clipped line endpoint must lie inside.
+    verts = np.asarray(mesh.vertices, dtype=float)
+    bbox_min = verts.min(axis=0)
+    bbox_max = verts.max(axis=0)
+    diag = float(np.linalg.norm(bbox_max - bbox_min))
+    tol = 0.05 * diag  # must be generous — the backend pads by 2% of diag
+
+    # Build a {(fa,fb): set[bi]} map from sharp boundaries so we can
+    # verify every emitted edge is adjacency-backed.
+    from collections import defaultdict
+    adj_pairs = defaultdict(set)
+    for bi, b in enumerate(state.boundaries):
+        if not b.sharp:
+            continue
+        ra = state.regions.get(b.region_a)
+        rb = state.regions.get(b.region_b)
+        if ra is None or rb is None:
+            continue
+        fa = ra.surface_family_id
+        fb = rb.surface_family_id
+        if fa < 0 or fb < 0 or fa == fb:
+            continue
+        key = (fa, fb) if fa < fb else (fb, fa)
+        adj_pairs[key].add(bi)
+
+    for e in edges:
+        assert e["kind"] == "plane_plane"
+        assert e["type_a"] == "plane" and e["type_b"] == "plane"
+        assert e["n_points"] == 2, f"expected line segment, got {e['n_points']} pts"
+        assert len(e["points"]) == 2
+        p0 = np.asarray(e["points"][0], dtype=float)
+        p1 = np.asarray(e["points"][1], dtype=float)
+        # Endpoints must live inside the padded bbox.
+        assert np.all(p0 >= bbox_min - tol) and np.all(p0 <= bbox_max + tol), (
+            f"edge endpoint {p0} outside bbox {bbox_min}..{bbox_max}"
+        )
+        assert np.all(p1 >= bbox_min - tol) and np.all(p1 <= bbox_max + tol)
+        # Non-degenerate segment.
+        assert np.linalg.norm(p1 - p0) > 1e-6
+
+        fa_id = e["family_a"]
+        fb_id = e["family_b"]
+        assert fa_id in state.surface_families
+        assert fb_id in state.surface_families
+
+        # Line direction must be perpendicular to both parent plane
+        # normals (that's literally the math of plane-plane intersection).
+        dir_vec = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-12)
+        n_a = np.asarray(state.surface_families[fa_id].canonical_params["normal"], dtype=float)
+        n_b = np.asarray(state.surface_families[fb_id].canonical_params["normal"], dtype=float)
+        n_a /= max(np.linalg.norm(n_a), 1e-12)
+        n_b /= max(np.linalg.norm(n_b), 1e-12)
+        assert abs(float(dir_vec @ n_a)) < 1e-3, (
+            f"edge direction not perpendicular to family {fa_id} normal "
+            f"(dot={dir_vec @ n_a:.4f})"
+        )
+        assert abs(float(dir_vec @ n_b)) < 1e-3, (
+            f"edge direction not perpendicular to family {fb_id} normal "
+            f"(dot={dir_vec @ n_b:.4f})"
+        )
+
+        # The family pair must be backed by at least one sharp boundary.
+        pair_key = (fa_id, fb_id) if fa_id < fb_id else (fb_id, fa_id)
+        assert pair_key in adj_pairs, (
+            f"family edge {pair_key} has no sharp boundary backing — "
+            f"the intersection pass emitted a phantom pair"
+        )
+        # And the backend should also report that count.
+        assert e["n_supporting_boundaries"] == len(adj_pairs[pair_key])
+
+
 def test_force_plane_override_takes_effect():
     """The force_plane override must actually change a region's fit.
 
@@ -686,6 +786,7 @@ ALL_TESTS = [
     ("partial_cone", test_partial_cone_is_cone),
     ("uneven_tessellation", test_uneven_tessellation_not_overfragmented),
     ("surface_family_grouping", test_surface_family_grouping_on_cube),
+    ("family_plane_intersections", test_family_plane_intersections_on_cube),
     ("fandisk_real_mesh", test_fandisk_real_mechanical_mesh),
     ("rocker_arm_freeform", test_rocker_arm_freeform_stays_honest),
     ("scanned11_raw_baseline", test_scanned11_raw_baseline),

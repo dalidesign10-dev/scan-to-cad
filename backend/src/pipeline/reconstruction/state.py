@@ -247,6 +247,10 @@ class ReconstructionState:
     boundaries: List[Boundary] = field(default_factory=list)
     constraints: List[Constraint] = field(default_factory=list)
     surface_families: Dict[int, "SurfaceFamily"] = field(default_factory=dict)
+    # Family-level analytic intersection edges (plane/plane → line,
+    # plane/cylinder → curve, ...). Pure JSON-shaped dicts so the
+    # overlay endpoint can ship them without a dataclass roundtrip.
+    intent_edges: List[Dict] = field(default_factory=list)
     # Optional cached arrays for the overlays endpoint:
     proxy_edge_confidence: Optional[np.ndarray] = None    # (E,) float in [0,1]
     proxy_edge_endpoints: Optional[np.ndarray] = None     # (E, 2, 3) float
@@ -342,6 +346,7 @@ class ReconstructionState:
             out["surface_families"] = [
                 f.to_dict() for f in sorted(self.surface_families.values(), key=lambda f: f.id)
             ]
+            out["intent_edges"] = list(self.intent_edges)
         return out
 
 

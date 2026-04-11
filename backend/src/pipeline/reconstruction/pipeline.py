@@ -273,6 +273,16 @@ def run_intent_segmentation(
         full_face_region=full_labels.astype(np.int64),
         metrics=metrics,
     )
+
+    # Family-level analytic intersections. Needs a finished state (so
+    # boundaries and families are both populated) — that's why it runs
+    # AFTER construction, not inline. Assigns to state.intent_edges.
+    if progress_callback:
+        progress_callback("intent", 99, "Intersecting surface families...")
+    from .intersect import compute_family_edges
+    state.intent_edges = compute_family_edges(state, mesh_vertices=full_vertices)
+    metrics["n_intent_edges"] = int(len(state.intent_edges))
+
     session["recon_state"] = state
 
     if progress_callback:
@@ -413,6 +423,9 @@ def get_intent_overlays(session) -> dict:
         "full_face_region_b64": _encode_int32(state.full_face_region) if state.full_face_region is not None else None,
         "regions": region_overlays,
         "surface_families": family_overlays,
+        # Family-level analytic intersection edges. One line per
+        # adjacent family pair (plane/plane only in this pass).
+        "family_edges": list(state.intent_edges),
         "sharp_edges": sharp_edges,
         "summary": state.summary(),
     }
