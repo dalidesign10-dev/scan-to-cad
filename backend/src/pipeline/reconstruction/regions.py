@@ -1,0 +1,1311 @@
+"""Region growing on the proxy mesh + RegionGraph construction.
+
+Two growers are available:
+
+  - `grow_regions` (mode="dihedral") — the original hybrid-boundary +
+    soft-normal-gate grower. Works well on clean CAD meshes where real
+    mechanical edges produce closed high-dihedral loops. On noisy scans
+    the hard-cut edges do NOT form closed loops and the grower walks
+    around them, collapsing the mesh into one mega-region.
+
+  - `grow_regions_fit_driven` (mode="fit_driven") — picks a seed face,
+    fits a plane/cylinder to its small neighborhood, then grows BFS while
+    new faces stay within residual tolerance of the current primitive.
+    When a face's vertices drift off the primitive (or its normal no
+    longer matches the expected orientation) growth stops there. This is
+    RANSAC region growing: boundaries fall out of the fit instead of
+    being detected separately. It's the only thing that works on scans
+    where the dihedral signal is fundamentally too noisy to close loops.
+
+`grow_regions` (dispatcher at the top of the file) takes a `mode`
+parameter so the pipeline can pick the right strategy per mesh class.
+"""
+
+from collections import defaultdict, deque
+from typing import Dict, List, Tuple
+import numpy as np
+
+from .boundary import BoundarySignals, SHARP_BOUNDARY_THRESHOLD
+from .fitting import fit_region
+from .state import Boundary, ConfidenceClass, MeshProxy, PrimitiveType
+
+
+HARD_CUT_CONFIDENCE = 0.55       # never cross if hybrid confidence above this
+SOFT_GATE_NORMAL_DEG = 18.0      # max angle to running region normal
+
+# Fit-driven grower tunables. These are bbox-diagonal relative so the same
+# numbers work on a 10mm boss and a 500mm bracket.
+FIT_SEED_MIN_FACES = 24          # BFS from seed until >= this many faces (plane pass)
+FIT_CYL_SEED_MIN_FACES = 12      # smaller seed for cylinder pass — small holes need to fit
+FIT_PLANE_TOL_REL = 0.008        # max |signed distance| / bbox for plane grow
+FIT_CYL_TOL_REL = 0.012          # max |radial residual| / bbox for cylinder grow
+FIT_CONE_TOL_REL = 0.018         # max perpendicular residual / bbox for cone grow
+FIT_PLANE_NORMAL_DEG = 18.0      # face-normal deviation from plane normal
+FIT_CYL_AXIS_PERP_DEG = 15.0     # face-normal may be this far from perpendicular-to-axis
+FIT_CONE_NORMAL_ANGLE_DEG = 15.0 # tolerance on |n·axis| - sin(α) alignment check
+
+# Boundary trim thresholds (fraction of the GROW tolerance). After BFS
+# growth, faces at region boundaries often have residuals just under the
+# grow tolerance — these inflate RMSE and suppress the HIGH-band inlier
+# ratio. The trim pass removes faces whose max-vertex residual exceeds
+# TRIM_FRAC of the original grow tolerance. 0.5 is aggressive (halves
+# the effective tolerance) but that's fine: the trim only removes a thin
+# boundary shell and the tiny-region absorber reclaims orphaned faces.
+TRIM_FRAC = 0.45
+
+# Cylinder-seed signature. The cheap SVD on the seed neighborhood's normals
+# decides whether it's worth trying a forced cylinder fit. A cylinder surface
+# has normals that lie IN a plane (sv[2] small) but actually SPAN that plane
+# (sv[1] non-trivial). A flat plane has sv[1] ≈ 0 (all normals parallel) and
+# gets filtered cheaply before we burn a full cylinder fit on it.
+#
+# These thresholds are deliberately strict. The cylinder pass can only HURT
+# the segmentation by claiming territory that belongs to a plane and then
+# growing across the plane via a loose tolerance. So we'd rather miss some
+# cylinders than false-positive: the plane pass that runs after still
+# segments the surface, just without the cylinder annotation.
+CYL_SEED_SV2_MAX = 0.10          # sv[2]/sv[0] — normals planar enough
+CYL_SEED_SV1_MIN = 0.20          # sv[1]/sv[0] — span the plane (not all parallel)
+# Absolute radius cap relative to the WHOLE mesh bbox (not the seed
+# neighborhood). A real cylindrical feature on a mechanical part is at most
+# half the part's bbox; anything bigger is a noisy plane being modeled as a
+# huge-radius cylinder.
+CYL_SEED_MAX_RADIUS_FRAC_OF_MESH = 0.50
+
+# Cone-seed signature. Same family as the cylinder signature, but for the
+# *small* circle case: a cone's unit normals lie on a small circle on the
+# unit sphere, so they have both a non-negligible mean (≈ -sin(α)·axis) AND
+# an sv[2]/sv[0] that's small-ish (slightly larger than a cylinder because
+# the circle isn't a geodesic). CONE_SEED_SV2_MAX is deliberately looser
+# than CYL_SEED_SV2_MAX so that partial chamfer cones survive the filter;
+# CONE_SEED_MEAN_NORMAL_MIN is what actually rules cylinders (mean ≈ 0) out.
+FIT_CONE_SEED_MIN_FACES = 16
+CONE_SEED_SV2_MAX = 0.32         # sv[2]/sv[0] — small circle spread, looser than cyl
+CONE_SEED_SV1_MIN = 0.15         # sv[1]/sv[0] — span the circle (not collapsed)
+CONE_SEED_MEAN_NORMAL_MIN = 0.10 # |mean(unit_n)| = sin(α); 0.10 → α ≳ 5.7°
+
+
+def grow_regions(
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    min_region_face_count: int = 12,
+    progress_callback=None,
+    mode: str = "dihedral",
+) -> np.ndarray:
+    """Dispatch to the selected growing strategy.
+
+    mode="dihedral" — original hybrid-boundary grower (good for clean CAD).
+    mode="fit_driven" — RANSAC-style primitive-driven grower (for scans).
+    """
+    if mode == "fit_driven":
+        return grow_regions_fit_driven(
+            proxy,
+            signals,
+            min_region_face_count=min_region_face_count,
+            progress_callback=progress_callback,
+        )
+    if mode != "dihedral":
+        raise ValueError(f"unknown grow_regions mode: {mode!r}")
+    return _grow_regions_dihedral(
+        proxy,
+        signals,
+        min_region_face_count=min_region_face_count,
+        progress_callback=progress_callback,
+    )
+
+
+def _grow_regions_dihedral(
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    min_region_face_count: int = 12,
+    progress_callback=None,
+) -> np.ndarray:
+    """Return a per-proxy-face int label vector. Labels are dense [0..K-1]."""
+
+    n = signals.n_faces
+    labels = np.full(n, -1, dtype=np.int64)
+    cur_label = 0
+
+    # Order seeds by face area so we start from the meatiest faces first;
+    # the running region normal is much more stable that way.
+    order = np.argsort(-proxy.face_areas)
+
+    if progress_callback:
+        progress_callback("intent.regions", 5, "Growing regions on proxy...")
+
+    cos_gate = float(np.cos(np.radians(SOFT_GATE_NORMAL_DEG)))
+
+    for seed in order:
+        seed = int(seed)
+        if labels[seed] >= 0:
+            continue
+        labels[seed] = cur_label
+        # Running normal is area-weighted (B3 fix) — kept around so we can
+        # report a stable region orientation later, but it is NO LONGER
+        # used as the soft-gate reference. Comparing every new face to the
+        # running mean breaks smooth curved surfaces (notably partial
+        # cylinders): on a half-tube arc the mean drifts to the arc-average
+        # direction and the next face looks 20°+ off the mean even though
+        # it is only 3° off the previous face. The grower then carves the
+        # cylinder into ~10 fragments which the plane fitter happily calls
+        # HIGH plane. The fix is to gate against the LOCAL source face we
+        # are growing from — sharp mechanical edges are still caught by
+        # the hard-cut on boundary confidence above.
+        running_normal = (
+            proxy.face_normals[seed].astype(np.float64)
+            * float(proxy.face_areas[seed])
+        )
+
+        q = deque([seed])
+        while q:
+            fi = q.popleft()
+            src_normal = proxy.face_normals[fi]
+            for nb, ei in signals.face_adj[fi]:
+                if labels[nb] >= 0:
+                    continue
+                if signals.confidence[ei] > HARD_CUT_CONFIDENCE:
+                    continue
+                # Soft gate against the local source face — lets smooth
+                # curved surfaces (cylinders) grow as one region.
+                if float(np.dot(proxy.face_normals[nb], src_normal)) < cos_gate:
+                    continue
+                labels[nb] = cur_label
+                running_normal += proxy.face_normals[nb] * float(proxy.face_areas[nb])
+                q.append(nb)
+
+        cur_label += 1
+
+    if progress_callback:
+        progress_callback("intent.regions", 65, f"Initial regions: {cur_label}")
+
+    labels = _absorb_tiny_regions(labels, proxy, signals, min_region_face_count)
+
+    if progress_callback:
+        progress_callback("intent.regions", 100, f"Final regions: {int(labels.max()) + 1}")
+
+    return labels
+
+
+def grow_regions_fit_driven(
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    min_region_face_count: int = 12,
+    progress_callback=None,
+) -> np.ndarray:
+    """Primitive-driven region growing.
+
+    For each unassigned seed, build a small BFS neighborhood, fit a plane
+    or cylinder to it, then grow outward while candidate faces stay
+    inside the current primitive's residual and normal-alignment
+    tolerances. When the fit can no longer absorb new faces, close this
+    region and pick the next seed.
+
+    Two passes:
+      1. Cylinder-seed-first scan. Walks unlabeled faces, tests each
+         seed neighborhood against a cheap cylinder signature (normal
+         SVD pattern: planar but spanning). Candidates that pass are
+         forced through the cylinder fitter; HIGH/MEDIUM cylinder fits
+         seed a region and grow. This runs first so plane growth can't
+         swallow tight cylindrical features before their own seed turn.
+      2. Plane-dominant pass. Area-ordered, auto-pick primitive. On
+         clean CAD this is where most planes come from. On the leftover
+         from pass 1, it picks up the flat faces around already-labeled
+         cylinders.
+
+    Key difference from the dihedral grower: the boundary between regions
+    is whatever line the primitive fit refuses to cross. We never need
+    dihedral edges to form closed loops — a noisy scan with soft CSG
+    joins still segments cleanly because the residual test fires
+    wherever the surface leaves the seed's primitive.
+    """
+    n = signals.n_faces
+    labels = np.full(n, -1, dtype=np.int64)
+    cur_label = 0
+
+    bbox_diag = float(np.linalg.norm(np.ptp(proxy.vertices, axis=0)))
+    if bbox_diag < 1e-9:
+        bbox_diag = 1.0
+
+    plane_tol = FIT_PLANE_TOL_REL * bbox_diag
+    cyl_tol = FIT_CYL_TOL_REL * bbox_diag
+    cone_tol = FIT_CONE_TOL_REL * bbox_diag
+    cos_plane_normal = float(np.cos(np.radians(FIT_PLANE_NORMAL_DEG)))
+    sin_cyl_perp = float(np.sin(np.radians(FIT_CYL_AXIS_PERP_DEG)))
+    cone_normal_sin_tol = float(np.sin(np.radians(FIT_CONE_NORMAL_ANGLE_DEG)))
+
+    grow_kwargs = dict(
+        plane_tol=plane_tol,
+        cyl_tol=cyl_tol,
+        cone_tol=cone_tol,
+        cos_plane_normal=cos_plane_normal,
+        sin_cyl_perp=sin_cyl_perp,
+        cone_normal_sin_tol=cone_normal_sin_tol,
+        reference_scale=bbox_diag,
+    )
+
+    if progress_callback:
+        progress_callback("intent.regions", 5, "Fit-driven: cylinder seed pass...")
+
+    # Pass 1: cylinder-seed-first scan.
+    cur_label = _cylinder_seed_pass(
+        proxy,
+        signals,
+        labels,
+        cur_label,
+        mesh_bbox_diag=bbox_diag,
+        **grow_kwargs,
+    )
+
+    if progress_callback:
+        progress_callback(
+            "intent.regions",
+            20,
+            f"Cylinder pass: {cur_label} regions; cone seed pass...",
+        )
+
+    # Pass 2: cone-seed scan. Same validate-after-grow discipline as the
+    # cylinder pass; runs AFTER cylinders so that chamfers adjacent to a
+    # through-hole don't accidentally hijack the hole's cylindrical faces.
+    cur_label = _cone_seed_pass(
+        proxy,
+        signals,
+        labels,
+        cur_label,
+        mesh_bbox_diag=bbox_diag,
+        **grow_kwargs,
+    )
+
+    if progress_callback:
+        progress_callback(
+            "intent.regions",
+            30,
+            f"Cone pass: {cur_label} regions; starting plane-dominant pass...",
+        )
+
+    # Pass 2: original area-ordered plane-dominant loop. Seeds: largest
+    # faces first. Already-labeled cylinder faces from pass 1 are
+    # skipped by the labels[seed] >= 0 check.
+    order = np.argsort(-proxy.face_areas)
+
+    for seed in order:
+        seed = int(seed)
+        if labels[seed] >= 0:
+            continue
+
+        # Build the seed neighborhood (small BFS ignoring already-labeled).
+        seed_faces = _seed_neighborhood(seed, labels, signals.face_adj, FIT_SEED_MIN_FACES)
+        if len(seed_faces) < 6:
+            # Too small to fit — leave it for tiny-region absorption.
+            for f in seed_faces:
+                if labels[f] < 0:
+                    labels[f] = cur_label
+            cur_label += 1
+            continue
+
+        # Fit plane + cylinder to the seed and pick the winner honestly.
+        seed_idx = np.asarray(seed_faces, dtype=np.int64)
+        vert_idx = np.unique(proxy.faces[seed_idx].flatten())
+        pts = proxy.vertices[vert_idx]
+        norms = proxy.face_normals[seed_idx]
+        fit = fit_region(pts, norms, fit_source="fit_driven_seed",
+                         reference_scale=bbox_diag)
+
+        if fit.type == PrimitiveType.UNKNOWN:
+            # No primitive fits the seed — claim just the seed's faces and
+            # move on. Tiny-region absorption will clean these up.
+            for f in seed_faces:
+                if labels[f] < 0:
+                    labels[f] = cur_label
+            cur_label += 1
+            continue
+
+        # Label the seed faces and seed the BFS queue with their neighbors.
+        for f in seed_faces:
+            if labels[f] < 0:
+                labels[f] = cur_label
+
+        q: deque = deque()
+        for f in seed_faces:
+            for nb, _ei in signals.face_adj[f]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+        region_face_count = int((np.asarray(labels) == cur_label).sum())
+        next_refit = max(2 * region_face_count, 60)
+
+        while q:
+            fi = q.popleft()
+            if labels[fi] >= 0:
+                continue
+            if not _face_passes_fit(
+                fi,
+                fit,
+                proxy,
+                plane_tol=plane_tol,
+                cyl_tol=cyl_tol,
+                cone_tol=cone_tol,
+                cos_plane_normal=cos_plane_normal,
+                sin_cyl_perp=sin_cyl_perp,
+                cone_normal_sin_tol=cone_normal_sin_tol,
+            ):
+                continue
+            labels[fi] = cur_label
+            region_face_count += 1
+            for nb, _ei in signals.face_adj[fi]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+            # Periodic refit. As the region grows, the primitive becomes
+            # better determined; a better fit lets growth continue deeper
+            # into the surface without drifting.
+            if region_face_count >= next_refit:
+                region_idx = np.where(labels == cur_label)[0].astype(np.int64)
+                r_verts = np.unique(proxy.faces[region_idx].flatten())
+                refit = fit_region(
+                    proxy.vertices[r_verts],
+                    proxy.face_normals[region_idx],
+                    fit_source="fit_driven_refit",
+                    forced_type=fit.type,
+                    reference_scale=bbox_diag,
+                )
+                if refit.confidence_class != ConfidenceClass.REJECTED and refit.type == fit.type:
+                    fit = refit
+                next_refit = int(region_face_count * 2)
+
+        cur_label += 1
+
+    if progress_callback:
+        progress_callback("intent.regions", 65, f"Initial fit-driven regions: {cur_label}")
+
+    # Boundary trim: remove the worst-fitting faces at each region's edge.
+    # The BFS grower accepts faces up to FIT_*_TOL_REL; the trim tightens
+    # each region to TRIM_FRAC of that tolerance.  This directly attacks
+    # the "stuck at MEDIUM" problem: boundary faces inflate RMSE and pull
+    # the HIGH-band inlier ratio below the gate.  Trimmed faces become -1
+    # and the tiny-region absorber merges them into neighbors.
+    labels = _trim_region_boundaries(
+        labels,
+        proxy,
+        bbox_diag=bbox_diag,
+        reference_scale=bbox_diag,
+        min_region_faces=min_region_face_count,
+    )
+
+    # Assign trimmed (-1) faces directly to their best adjacent labeled
+    # region. This avoids the explosion of thousands of individual orphan
+    # labels that overwhelmed the absorber in earlier attempts. Each
+    # trimmed face is boundary-adjacent to at least one labeled region;
+    # we pick the neighbor that shares the most edges (= most compatible
+    # geometry, since the grower already validated those adjacencies).
+    orphan_mask = labels == -1
+    if orphan_mask.any():
+        for fi in np.where(orphan_mask)[0]:
+            neighbor_labels: Dict[int, int] = {}
+            for nb, _ei in signals.face_adj[int(fi)]:
+                nb_lbl = int(labels[nb])
+                if nb_lbl >= 0:
+                    neighbor_labels[nb_lbl] = neighbor_labels.get(nb_lbl, 0) + 1
+            if neighbor_labels:
+                labels[fi] = max(neighbor_labels, key=neighbor_labels.get)
+        # Any remaining -1 faces (no labeled neighbors) get individual labels.
+        still_orphan = labels == -1
+        if still_orphan.any():
+            cur_label = int(labels.max()) + 1
+            for fi in np.where(still_orphan)[0]:
+                labels[fi] = cur_label
+                cur_label += 1
+
+    if progress_callback:
+        progress_callback("intent.regions", 72, "Trimmed boundaries; absorbing tiny regions...")
+
+    labels = _absorb_tiny_regions(labels, proxy, signals, min_region_face_count)
+
+    if progress_callback:
+        progress_callback("intent.regions", 82, "Merging compatible adjacent regions...")
+
+    labels = _merge_compatible_regions(
+        labels,
+        proxy,
+        signals,
+        reference_scale=bbox_diag,
+        min_region_faces=min_region_face_count,
+    )
+
+    if progress_callback:
+        progress_callback("intent.regions", 100, f"Final regions: {int(labels.max()) + 1}")
+
+    return labels
+
+
+# Merge thresholds. Two adjacent regions of the same primitive type are
+# "compatible" when their parameters agree within these tolerances. The
+# merge is only committed when the combined region's refit grades at
+# least as high as the better of the two originals.
+MERGE_PLANE_NORMAL_COS = 0.9975   # ≈ 4° between normals
+MERGE_PLANE_D_REL = 0.006         # |d₁ - d₂| / bbox_diag
+MERGE_CYL_AXIS_COS = 0.995       # ≈ 5.7° between axes
+MERGE_CYL_RADIUS_REL = 0.10      # |r₁ - r₂| / max(r₁, r₂)
+MERGE_CYL_CENTER_REL = 0.05      # lateral axis-to-axis / bbox_diag
+
+
+def _merge_compatible_regions(
+    labels: np.ndarray,
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    reference_scale: float,
+    min_region_faces: int,
+) -> np.ndarray:
+    """Merge adjacent regions whose primitive fits are compatible.
+
+    The idea: the BFS grower sometimes splits a single mechanical face
+    into two regions (different seeds that both grade MEDIUM). If the
+    two regions have the same primitive type with similar parameters,
+    the combined region has more inlier points and often grades HIGH.
+
+    Only merges that don't lower the best confidence class are kept.
+    """
+    n_labels = int(labels.max()) + 1 if labels.size else 0
+    if n_labels <= 1:
+        return labels
+
+    # Fit every region once.
+    fits = {}
+    for r in range(n_labels):
+        mask = labels == r
+        n_faces = int(mask.sum())
+        if n_faces < min_region_faces:
+            continue
+        idx = np.where(mask)[0].astype(np.int64)
+        vert_idx = np.unique(proxy.faces[idx].flatten())
+        if vert_idx.size < 8:
+            continue
+        pts = proxy.vertices[vert_idx]
+        norms = proxy.face_normals[idx]
+        fits[r] = fit_region(pts, norms, fit_source="merge_eval",
+                             reference_scale=reference_scale)
+
+    # Build region adjacency from edge data.
+    adj: Dict[int, set] = defaultdict(set)
+    for ei in range(signals.n_edges):
+        a = int(labels[signals.edge_face_pairs[ei, 0]])
+        b = int(labels[signals.edge_face_pairs[ei, 1]])
+        if a != b:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    class_order = {
+        ConfidenceClass.HIGH: 3,
+        ConfidenceClass.MEDIUM: 2,
+        ConfidenceClass.LOW: 1,
+        ConfidenceClass.REJECTED: 0,
+    }
+
+    # Greedy merge: process pairs sorted by combined face count
+    # (largest first, so we stabilize big regions before small ones).
+    counts = np.bincount(labels, minlength=n_labels)
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        # Collect candidate pairs.
+        pairs = []
+        seen = set()
+        for a in list(adj.keys()):
+            if a not in fits:
+                continue
+            for b in adj[a]:
+                if b not in fits:
+                    continue
+                key = (min(a, b), max(a, b))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if fits[a].type != fits[b].type:
+                    continue
+                if fits[a].type == PrimitiveType.UNKNOWN:
+                    continue
+                pairs.append((a, b, int(counts[a]) + int(counts[b])))
+
+        pairs.sort(key=lambda x: x[2], reverse=True)
+
+        for a, b, _ in pairs:
+            if a not in fits or b not in fits:
+                continue  # one side already merged away
+            fa, fb = fits[a], fits[b]
+            if fa.type != fb.type:
+                continue
+
+            if not _params_compatible(fa, fb, reference_scale):
+                continue
+
+            # Try the merge: combine faces, refit, check grade.
+            mask_a = labels == a
+            mask_b = labels == b
+            combined_idx = np.where(mask_a | mask_b)[0].astype(np.int64)
+            vert_idx = np.unique(proxy.faces[combined_idx].flatten())
+            if vert_idx.size < 8:
+                continue
+            pts = proxy.vertices[vert_idx]
+            norms = proxy.face_normals[combined_idx]
+            combined_fit = fit_region(
+                pts, norms, fit_source="merge_refit",
+                forced_type=fa.type,
+                reference_scale=reference_scale,
+            )
+            if combined_fit.confidence_class == ConfidenceClass.REJECTED:
+                continue
+
+            # Accept the merge if the combined grade is >= the best original.
+            best_orig = max(class_order[fa.confidence_class],
+                            class_order[fb.confidence_class])
+            combined_grade = class_order[combined_fit.confidence_class]
+            if combined_grade < best_orig:
+                continue
+
+            # Commit the merge: relabel b → a, update bookkeeping.
+            labels[mask_b] = a
+            counts[a] += counts[b]
+            counts[b] = 0
+            fits[a] = combined_fit
+            del fits[b]
+            # Update adjacency: b's neighbors become a's neighbors.
+            for nb in adj.get(b, set()):
+                if nb == a:
+                    continue
+                adj[a].add(nb)
+                adj[nb].discard(b)
+                adj[nb].add(a)
+            adj.pop(b, None)
+            adj[a].discard(b)
+            merged_any = True
+
+    # Contiguously relabel.
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    out = np.empty_like(labels)
+    for fi in range(labels.shape[0]):
+        out[fi] = remap[int(labels[fi])]
+    return out
+
+
+def _params_compatible(
+    fa,
+    fb,
+    bbox_diag: float,
+) -> bool:
+    """Check if two fits of the same type have compatible parameters."""
+    if fa.type == PrimitiveType.PLANE:
+        n_a = np.asarray(fa.params["normal"], dtype=np.float64)
+        n_b = np.asarray(fb.params["normal"], dtype=np.float64)
+        cos_angle = abs(float(np.dot(n_a, n_b)))
+        if cos_angle < MERGE_PLANE_NORMAL_COS:
+            return False
+        d_a = float(fa.params["d"])
+        d_b = float(fb.params["d"])
+        # Normals might point in opposite directions; use the sign-corrected
+        # distance difference.
+        if float(np.dot(n_a, n_b)) < 0:
+            d_diff = abs(d_a + d_b)
+        else:
+            d_diff = abs(d_a - d_b)
+        if d_diff / max(bbox_diag, 1e-12) > MERGE_PLANE_D_REL:
+            return False
+        return True
+
+    if fa.type == PrimitiveType.CYLINDER:
+        ax_a = np.asarray(fa.params["axis"], dtype=np.float64)
+        ax_b = np.asarray(fb.params["axis"], dtype=np.float64)
+        if abs(float(np.dot(ax_a, ax_b))) < MERGE_CYL_AXIS_COS:
+            return False
+        r_a = float(fa.params["radius"])
+        r_b = float(fb.params["radius"])
+        if abs(r_a - r_b) / max(r_a, r_b, 1e-12) > MERGE_CYL_RADIUS_REL:
+            return False
+        # Check lateral offset between axes (are they coaxial?).
+        c_a = np.asarray(fa.params["center"], dtype=np.float64)
+        c_b = np.asarray(fb.params["center"], dtype=np.float64)
+        avg_axis = (ax_a + ax_b) / 2.0
+        avg_axis /= max(np.linalg.norm(avg_axis), 1e-12)
+        delta = c_b - c_a
+        lateral = delta - float(np.dot(delta, avg_axis)) * avg_axis
+        if float(np.linalg.norm(lateral)) / max(bbox_diag, 1e-12) > MERGE_CYL_CENTER_REL:
+            return False
+        return True
+
+    if fa.type == PrimitiveType.CONE:
+        ax_a = np.asarray(fa.params["axis"], dtype=np.float64)
+        ax_b = np.asarray(fb.params["axis"], dtype=np.float64)
+        if abs(float(np.dot(ax_a, ax_b))) < MERGE_CYL_AXIS_COS:
+            return False
+        ha_a = float(fa.params["half_angle_deg"])
+        ha_b = float(fb.params["half_angle_deg"])
+        if abs(ha_a - ha_b) > 5.0:  # 5° half-angle tolerance
+            return False
+        return True
+
+    return False
+
+
+def _cylinder_seed_pass(
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    labels: np.ndarray,
+    cur_label: int,
+    mesh_bbox_diag: float,
+    plane_tol: float,
+    cyl_tol: float,
+    cone_tol: float,
+    cos_plane_normal: float,
+    sin_cyl_perp: float,
+    cone_normal_sin_tol: float,
+    reference_scale: float = 0.0,
+) -> int:
+    """Walk unlabeled faces, seed any neighborhood that looks like a
+    cylindrical patch, force a cylinder fit, and grow it if the fit
+    grades HIGH or MEDIUM.
+
+    The seed order is area-descending — same as the plane pass — but
+    most plane-like seeds are filtered out cheaply by the normal-SVD
+    signature before we ever call `fit_region`. What survives the
+    signature filter and passes a forced cylinder fit gets a region.
+    Anything that fails is left alone for the plane-dominant pass that
+    runs after this one.
+
+    Mutates `labels` in place. Returns the new cur_label.
+    """
+    order = np.argsort(-proxy.face_areas)
+
+    for seed in order:
+        seed = int(seed)
+        if labels[seed] >= 0:
+            continue
+
+        seed_faces = _seed_neighborhood(seed, labels, signals.face_adj, FIT_CYL_SEED_MIN_FACES)
+        if len(seed_faces) < 8:
+            continue  # too small to identify a cylinder; plane pass will handle
+
+        seed_idx = np.asarray(seed_faces, dtype=np.int64)
+        seed_normals = proxy.face_normals[seed_idx]
+
+        # Cheap cylinder signature: normals must lie on a great circle.
+        # Center the normal cloud and SVD it. Cylinder → sv[2] near zero
+        # (normals are planar) AND sv[1] not tiny (they span the plane).
+        nc = seed_normals - seed_normals.mean(axis=0)
+        try:
+            _, sv, _ = np.linalg.svd(nc, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        if sv[0] < 1e-9:
+            continue
+        sv2_ratio = float(sv[2] / sv[0])
+        sv1_ratio = float(sv[1] / sv[0])
+        if sv2_ratio > CYL_SEED_SV2_MAX:
+            continue  # normals not planar enough — likely a curved freeform patch
+        if sv1_ratio < CYL_SEED_SV1_MIN:
+            continue  # normals all parallel — this is a plane, skip
+
+        # Passed the signature. Try a forced cylinder fit.
+        vert_idx = np.unique(proxy.faces[seed_idx].flatten())
+        pts = proxy.vertices[vert_idx]
+        fit = fit_region(
+            pts,
+            seed_normals,
+            fit_source="cyl_seed",
+            forced_type=PrimitiveType.CYLINDER,
+            reference_scale=reference_scale,
+        )
+        if fit.type != PrimitiveType.CYLINDER:
+            continue
+        # Accept HIGH and MEDIUM. The strict gate is the radius cap below
+        # — that's what filters out noisy planes interpreted as huge-radius
+        # cylinders, not the confidence class.
+        if fit.confidence_class not in (ConfidenceClass.HIGH, ConfidenceClass.MEDIUM):
+            continue
+        # Absolute radius cap relative to the WHOLE mesh. A real mechanical
+        # cylinder is at most ~half the part's bbox; a 5x-bbox-radius
+        # cylinder is just a slightly-curved noisy plane and growing one
+        # would eat into adjacent plane regions on the next pass.
+        radius = float(fit.params.get("radius", 0.0))
+        if radius > mesh_bbox_diag * CYL_SEED_MAX_RADIUS_FRAC_OF_MESH:
+            continue
+
+        # Seed the region with the entire seed neighborhood, then BFS
+        # outward using the same residual/normal gate as the main grower.
+        # We use a TENTATIVE label here — the grown region only commits if
+        # the final refit grades HIGH. Noisy MEDIUM cylinder seeds are
+        # exactly how the cylinder pass used to eat plane area on scans.
+        tentative = cur_label
+        for f in seed_faces:
+            if labels[f] < 0:
+                labels[f] = tentative
+
+        q: deque = deque()
+        for f in seed_faces:
+            for nb, _ei in signals.face_adj[f]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+        region_face_count = int((labels == tentative).sum())
+        next_refit = max(2 * region_face_count, 60)
+
+        while q:
+            fi = q.popleft()
+            if labels[fi] >= 0:
+                continue
+            if not _face_passes_fit(
+                fi,
+                fit,
+                proxy,
+                plane_tol=plane_tol,
+                cyl_tol=cyl_tol,
+                cone_tol=cone_tol,
+                cos_plane_normal=cos_plane_normal,
+                sin_cyl_perp=sin_cyl_perp,
+                cone_normal_sin_tol=cone_normal_sin_tol,
+            ):
+                continue
+            labels[fi] = tentative
+            region_face_count += 1
+            for nb, _ei in signals.face_adj[fi]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+            if region_face_count >= next_refit:
+                region_idx = np.where(labels == tentative)[0].astype(np.int64)
+                r_verts = np.unique(proxy.faces[region_idx].flatten())
+                refit = fit_region(
+                    proxy.vertices[r_verts],
+                    proxy.face_normals[region_idx],
+                    fit_source="cyl_seed_refit",
+                    forced_type=PrimitiveType.CYLINDER,
+                    reference_scale=reference_scale,
+                )
+                if (
+                    refit.type == PrimitiveType.CYLINDER
+                    and refit.confidence_class != ConfidenceClass.REJECTED
+                ):
+                    fit = refit
+                next_refit = int(region_face_count * 2)
+
+        # Final validation refit on the entire grown region. If the cylinder
+        # didn't actually crystallize at HIGH confidence, release the labels
+        # back to -1 so the plane pass can reclaim the territory. This is
+        # what stops noisy MED seeds from polluting the segmentation.
+        region_mask = labels == tentative
+        n_region = int(region_mask.sum())
+        keep = False
+        if n_region >= 12:
+            region_idx = np.where(region_mask)[0].astype(np.int64)
+            r_verts = np.unique(proxy.faces[region_idx].flatten())
+            final = fit_region(
+                proxy.vertices[r_verts],
+                proxy.face_normals[region_idx],
+                fit_source="cyl_seed_final",
+                forced_type=PrimitiveType.CYLINDER,
+                reference_scale=reference_scale,
+            )
+            if (
+                final.type == PrimitiveType.CYLINDER
+                and final.confidence_class == ConfidenceClass.HIGH
+                and float(final.params.get("radius", 0.0))
+                    <= mesh_bbox_diag * CYL_SEED_MAX_RADIUS_FRAC_OF_MESH
+            ):
+                keep = True
+
+        if keep:
+            cur_label += 1
+        else:
+            labels[region_mask] = -1
+
+    return cur_label
+
+
+def _cone_seed_pass(
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    labels: np.ndarray,
+    cur_label: int,
+    mesh_bbox_diag: float,
+    plane_tol: float,
+    cyl_tol: float,
+    cone_tol: float,
+    cos_plane_normal: float,
+    sin_cyl_perp: float,
+    cone_normal_sin_tol: float,
+    reference_scale: float = 0.0,
+) -> int:
+    """Walk unlabeled faces, seed any neighborhood that looks conical,
+    force a cone fit, and grow it if the fit grades HIGH or MEDIUM.
+
+    Mirrors `_cylinder_seed_pass` but uses the cone signature:
+
+        - sv[2]/sv[0] small (normals on a *small* circle on the sphere)
+        - |mean(unit_normals)| ≥ CONE_SEED_MEAN_NORMAL_MIN
+          (this is the `sin(α)` signature that separates a cone from a
+          cylinder — a cylinder has mean(n) ≈ 0)
+
+    Validate-after-grow: the grown region is only committed if the final
+    refit on the entire territory still grades HIGH. Medium-confidence
+    cone seeds that grew by swallowing adjacent near-planar territory get
+    released back to -1 so the plane pass can reclaim them.
+
+    Mutates `labels` in place. Returns the new cur_label.
+    """
+    order = np.argsort(-proxy.face_areas)
+
+    for seed in order:
+        seed = int(seed)
+        if labels[seed] >= 0:
+            continue
+
+        seed_faces = _seed_neighborhood(seed, labels, signals.face_adj, FIT_CONE_SEED_MIN_FACES)
+        if len(seed_faces) < 10:
+            continue  # too small to identify a cone; plane pass handles it
+
+        seed_idx = np.asarray(seed_faces, dtype=np.int64)
+        seed_normals = proxy.face_normals[seed_idx]
+
+        # Normalize for the mean-normal signature to be meaningful.
+        n_len = np.linalg.norm(seed_normals, axis=1)
+        if np.any(n_len < 1e-9):
+            continue
+        unit_n = seed_normals / n_len[:, None]
+
+        mean_n = unit_n.mean(axis=0)
+        mean_n_mag = float(np.linalg.norm(mean_n))
+        if mean_n_mag < CONE_SEED_MEAN_NORMAL_MIN:
+            continue  # cylinder-like (symmetric) or flat — let other passes handle
+
+        nc = unit_n - mean_n
+        try:
+            _, sv, _ = np.linalg.svd(nc, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        if sv[0] < 1e-9:
+            continue
+        sv2_ratio = float(sv[2] / sv[0])
+        sv1_ratio = float(sv[1] / sv[0])
+        if sv2_ratio > CONE_SEED_SV2_MAX:
+            continue  # normals not on a small circle — freeform or noisy
+        if sv1_ratio < CONE_SEED_SV1_MIN:
+            continue  # collapsed circle — effectively a plane
+
+        # Passed the signature. Try a forced cone fit.
+        vert_idx = np.unique(proxy.faces[seed_idx].flatten())
+        pts = proxy.vertices[vert_idx]
+        fit = fit_region(
+            pts,
+            seed_normals,
+            fit_source="cone_seed",
+            forced_type=PrimitiveType.CONE,
+            reference_scale=reference_scale,
+        )
+        if fit.type != PrimitiveType.CONE:
+            continue
+        if fit.confidence_class not in (ConfidenceClass.HIGH, ConfidenceClass.MEDIUM):
+            continue
+
+        tentative = cur_label
+        for f in seed_faces:
+            if labels[f] < 0:
+                labels[f] = tentative
+
+        q: deque = deque()
+        for f in seed_faces:
+            for nb, _ei in signals.face_adj[f]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+        region_face_count = int((labels == tentative).sum())
+        next_refit = max(2 * region_face_count, 60)
+
+        while q:
+            fi = q.popleft()
+            if labels[fi] >= 0:
+                continue
+            if not _face_passes_fit(
+                fi,
+                fit,
+                proxy,
+                plane_tol=plane_tol,
+                cyl_tol=cyl_tol,
+                cone_tol=cone_tol,
+                cos_plane_normal=cos_plane_normal,
+                sin_cyl_perp=sin_cyl_perp,
+                cone_normal_sin_tol=cone_normal_sin_tol,
+            ):
+                continue
+            labels[fi] = tentative
+            region_face_count += 1
+            for nb, _ei in signals.face_adj[fi]:
+                if labels[nb] < 0:
+                    q.append(nb)
+
+            if region_face_count >= next_refit:
+                region_idx = np.where(labels == tentative)[0].astype(np.int64)
+                r_verts = np.unique(proxy.faces[region_idx].flatten())
+                refit = fit_region(
+                    proxy.vertices[r_verts],
+                    proxy.face_normals[region_idx],
+                    fit_source="cone_seed_refit",
+                    forced_type=PrimitiveType.CONE,
+                    reference_scale=reference_scale,
+                )
+                if (
+                    refit.type == PrimitiveType.CONE
+                    and refit.confidence_class != ConfidenceClass.REJECTED
+                ):
+                    fit = refit
+                next_refit = int(region_face_count * 2)
+
+        # Validate-after-grow: only keep the region if the refit on all
+        # grown faces still grades HIGH. Cones are more ambiguous than
+        # cylinders (the mean-normal signature overlaps with curved fillets
+        # and noisy near-conical freeform patches), so the bar to commit
+        # is deliberately strict.
+        region_mask = labels == tentative
+        n_region = int(region_mask.sum())
+        keep = False
+        if n_region >= 12:
+            region_idx = np.where(region_mask)[0].astype(np.int64)
+            r_verts = np.unique(proxy.faces[region_idx].flatten())
+            final = fit_region(
+                proxy.vertices[r_verts],
+                proxy.face_normals[region_idx],
+                fit_source="cone_seed_final",
+                forced_type=PrimitiveType.CONE,
+                reference_scale=reference_scale,
+            )
+            if (
+                final.type == PrimitiveType.CONE
+                and final.confidence_class == ConfidenceClass.HIGH
+            ):
+                keep = True
+
+        if keep:
+            cur_label += 1
+        else:
+            labels[region_mask] = -1
+
+    return cur_label
+
+
+def _seed_neighborhood(
+    seed: int,
+    labels: np.ndarray,
+    face_adj: List[List[Tuple[int, int]]],
+    target: int,
+) -> List[int]:
+    """BFS from `seed`, expanding into unlabeled faces only, until we
+    have at least `target` faces (or run out of reachable unlabeled ones).
+    """
+    out = [seed]
+    visited = {seed}
+    q: deque = deque([seed])
+    while q and len(out) < target:
+        f = q.popleft()
+        for nb, _ei in face_adj[f]:
+            if nb in visited:
+                continue
+            if labels[nb] >= 0:
+                continue
+            visited.add(nb)
+            out.append(nb)
+            if len(out) >= target:
+                break
+            q.append(nb)
+    return out
+
+
+def _face_passes_fit(
+    fi: int,
+    fit,
+    proxy: MeshProxy,
+    plane_tol: float,
+    cyl_tol: float,
+    cone_tol: float,
+    cos_plane_normal: float,
+    sin_cyl_perp: float,
+    cone_normal_sin_tol: float,
+) -> bool:
+    """Return True if face `fi` can be absorbed into the current fit.
+
+    Uses the MAX residual across the face's three vertices (not the mean)
+    so we don't let a barely-off face slip in just because one vertex
+    happens to land on the primitive.
+    """
+    if fit.type == PrimitiveType.PLANE:
+        n = np.asarray(fit.params["normal"], dtype=np.float64)
+        d = float(fit.params["d"])
+        tri = proxy.vertices[proxy.faces[fi]]
+        residuals = np.abs(tri @ n + d)
+        if residuals.max() > plane_tol:
+            return False
+        face_normal = proxy.face_normals[fi]
+        if abs(float(np.dot(face_normal, n))) < cos_plane_normal:
+            return False
+        return True
+
+    if fit.type == PrimitiveType.CYLINDER:
+        axis = np.asarray(fit.params["axis"], dtype=np.float64)
+        center = np.asarray(fit.params["center"], dtype=np.float64)
+        radius = float(fit.params["radius"])
+        tri = proxy.vertices[proxy.faces[fi]]
+        diff = tri - center
+        proj = (diff @ axis)[:, None] * axis
+        radial = np.linalg.norm(diff - proj, axis=1)
+        residuals = np.abs(radial - radius)
+        if residuals.max() > cyl_tol:
+            return False
+        # Face normal should be (approximately) perpendicular to the axis
+        # on the surface of a cylinder. sin of the angle = |dot(n, axis)|.
+        face_normal = proxy.face_normals[fi]
+        if abs(float(np.dot(face_normal, axis))) > sin_cyl_perp:
+            return False
+        return True
+
+    if fit.type == PrimitiveType.CONE:
+        axis = np.asarray(fit.params["axis"], dtype=np.float64)
+        apex = np.asarray(fit.params["apex"], dtype=np.float64)
+        half_angle_deg = float(fit.params["half_angle_deg"])
+        half_angle_rad = np.radians(half_angle_deg)
+        sin_a = float(np.sin(half_angle_rad))
+        cos_a = float(np.cos(half_angle_rad))
+        tri = proxy.vertices[proxy.faces[fi]]
+        diff = tri - apex
+        s_axial = diff @ axis
+        perp = diff - np.outer(s_axial, axis)
+        r_radial = np.linalg.norm(perp, axis=1)
+        residuals = np.abs(r_radial * cos_a - np.abs(s_axial) * sin_a)
+        if residuals.max() > cone_tol:
+            return False
+        # Face-normal alignment: on a cone of half-angle α, an outward
+        # unit normal has |n · axis| = sin(α). Tolerance is expressed in
+        # the same "sin of angular deviation" units.
+        face_normal = proxy.face_normals[fi]
+        if abs(abs(float(np.dot(face_normal, axis))) - sin_a) > cone_normal_sin_tol:
+            return False
+        return True
+
+    return False
+
+
+def _trim_region_boundaries(
+    labels: np.ndarray,
+    proxy: MeshProxy,
+    bbox_diag: float,
+    reference_scale: float,
+    min_region_faces: int,
+) -> np.ndarray:
+    """Remove the worst-fitting boundary faces from each region.
+
+    For every region with >= min_region_faces faces, this function:
+      1. Fits the region's best primitive (plane/cylinder/cone).
+      2. Computes per-face max-vertex residual against the fit.
+      3. Removes faces whose residual exceeds TRIM_FRAC * the
+         type-appropriate grow tolerance.
+      4. Sets removed faces' labels to -1 (unlabeled).
+
+    The trimmed faces will be picked up by `_absorb_tiny_regions`
+    which merges them into the best-matching neighbor. The net effect
+    is that region boundaries become tighter and the fit quality
+    improves without changing which faces the grower explored.
+
+    Returns a new labels array (mutated in place).
+    """
+    n_labels = int(labels.max()) + 1 if labels.size else 0
+    if n_labels == 0:
+        return labels
+
+    # Per-type trim thresholds, in absolute units.
+    plane_trim = TRIM_FRAC * FIT_PLANE_TOL_REL * bbox_diag
+    cyl_trim = TRIM_FRAC * FIT_CYL_TOL_REL * bbox_diag
+    cone_trim = TRIM_FRAC * FIT_CONE_TOL_REL * bbox_diag
+
+    for r in range(n_labels):
+        region_mask = labels == r
+        n_faces = int(region_mask.sum())
+        if n_faces < min_region_faces:
+            continue
+
+        region_idx = np.where(region_mask)[0].astype(np.int64)
+        vert_idx = np.unique(proxy.faces[region_idx].flatten())
+        pts = proxy.vertices[vert_idx]
+        norms = proxy.face_normals[region_idx]
+
+        if pts.shape[0] < 8:
+            continue
+
+        fit = fit_region(pts, norms, fit_source="trim",
+                         reference_scale=reference_scale)
+
+        # Only trim planes — cylinder and cone regions don't benefit from
+        # boundary trimming (their grow tolerances are already tight and
+        # trimming loses more area than it promotes).
+        if fit.type != PrimitiveType.PLANE:
+            continue
+
+        # Compute per-face max-vertex residual and decide the threshold.
+        if fit.type == PrimitiveType.PLANE:
+            n_vec = np.asarray(fit.params["normal"], dtype=np.float64)
+            d_val = float(fit.params["d"])
+            trim_thr = plane_trim
+            to_drop = []
+            for fi in region_idx:
+                tri = proxy.vertices[proxy.faces[fi]]
+                res = np.abs(tri @ n_vec + d_val)
+                if res.max() > trim_thr:
+                    to_drop.append(fi)
+
+        elif fit.type == PrimitiveType.CYLINDER:
+            axis = np.asarray(fit.params["axis"], dtype=np.float64)
+            center = np.asarray(fit.params["center"], dtype=np.float64)
+            radius = float(fit.params["radius"])
+            trim_thr = cyl_trim
+            to_drop = []
+            for fi in region_idx:
+                tri = proxy.vertices[proxy.faces[fi]]
+                diff = tri - center
+                proj = (diff @ axis)[:, None] * axis
+                radial = np.linalg.norm(diff - proj, axis=1)
+                res = np.abs(radial - radius)
+                if res.max() > trim_thr:
+                    to_drop.append(fi)
+
+        elif fit.type == PrimitiveType.CONE:
+            axis = np.asarray(fit.params["axis"], dtype=np.float64)
+            apex = np.asarray(fit.params["apex"], dtype=np.float64)
+            ha_rad = np.radians(float(fit.params["half_angle_deg"]))
+            sin_a = float(np.sin(ha_rad))
+            cos_a = float(np.cos(ha_rad))
+            trim_thr = cone_trim
+            to_drop = []
+            for fi in region_idx:
+                tri = proxy.vertices[proxy.faces[fi]]
+                diff = tri - apex
+                s_ax = diff @ axis
+                perp = diff - np.outer(s_ax, axis)
+                r_rad = np.linalg.norm(perp, axis=1)
+                res = np.abs(r_rad * cos_a - np.abs(s_ax) * sin_a)
+                if res.max() > trim_thr:
+                    to_drop.append(fi)
+        else:
+            continue
+
+        # Only trim if we're not destroying the region.
+        if len(to_drop) > 0 and (n_faces - len(to_drop)) >= min_region_faces:
+            for fi in to_drop:
+                labels[fi] = -1
+
+    return labels
+
+
+def _absorb_tiny_regions(
+    labels: np.ndarray,
+    proxy: MeshProxy,
+    signals: BoundarySignals,
+    min_face_count: int,
+) -> np.ndarray:
+    """Absorb regions with < min_face_count faces into the best-matching
+    larger neighbor (the one we share the longest soft boundary with).
+
+    "Best" prefers neighbors whose mean normal is close to ours, so we don't
+    glue across ridges that the grower correctly refused to cross.
+    """
+    n_labels = int(labels.max()) + 1 if labels.size else 0
+    if n_labels <= 1:
+        return labels
+
+    # Per-region face count and mean normal
+    counts = np.bincount(labels, minlength=n_labels)
+    region_normal = np.zeros((n_labels, 3), dtype=np.float64)
+    for fi in range(labels.shape[0]):
+        region_normal[labels[fi]] += proxy.face_normals[fi]
+    norms = np.linalg.norm(region_normal, axis=1, keepdims=True)
+    region_normal_unit = region_normal / np.maximum(norms, 1e-12)
+
+    changed = True
+    while changed:
+        changed = False
+        # Build per-region adjacency on the fly so it stays consistent.
+        region_neighbors: Dict[int, Dict[int, List[int]]] = defaultdict(lambda: defaultdict(list))
+        for ei in range(signals.n_edges):
+            a = labels[signals.edge_face_pairs[ei, 0]]
+            b = labels[signals.edge_face_pairs[ei, 1]]
+            if a == b:
+                continue
+            region_neighbors[int(a)][int(b)].append(ei)
+            region_neighbors[int(b)][int(a)].append(ei)
+
+        for r in range(n_labels):
+            if counts[r] == 0 or counts[r] >= min_face_count:
+                continue
+            neigh = region_neighbors.get(r, {})
+            if not neigh:
+                continue
+            best_nb = None
+            best_score = -1.0
+            for nb, edge_ids in neigh.items():
+                if counts[nb] == 0:
+                    continue
+                shared = len(edge_ids)
+                normal_sim = float(np.dot(region_normal_unit[r], region_normal_unit[nb]))
+                score = 0.6 * normal_sim + 0.4 * (shared / max(counts[r], 1))
+                if score > best_score:
+                    best_score = score
+                    best_nb = nb
+            if best_nb is None:
+                continue
+            mask = labels == r
+            labels[mask] = best_nb
+            counts[best_nb] += counts[r]
+            counts[r] = 0
+            region_normal[best_nb] += region_normal[r]
+            n_b = np.linalg.norm(region_normal[best_nb])
+            if n_b > 1e-12:
+                region_normal_unit[best_nb] = region_normal[best_nb] / n_b
+            changed = True
+
+    # Contiguously relabel
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    out = np.empty_like(labels)
+    for fi in range(labels.shape[0]):
+        out[fi] = remap[int(labels[fi])]
+    return out
+
+
+def build_region_graph(
+    labels: np.ndarray,
+    signals: BoundarySignals,
+) -> List[Boundary]:
+    """Aggregate edge-level signals into RegionGraph Boundary entries."""
+    pair_data: Dict[Tuple[int, int], Dict] = {}
+    for ei in range(signals.n_edges):
+        a = int(labels[signals.edge_face_pairs[ei, 0]])
+        b = int(labels[signals.edge_face_pairs[ei, 1]])
+        if a == b:
+            continue
+        key = (a, b) if a < b else (b, a)
+        d = pair_data.setdefault(key, {
+            "confs": [],
+            "diheds": [],
+        })
+        d["confs"].append(float(signals.confidence[ei]))
+        d["diheds"].append(float(signals.dihedral_deg[ei]))
+
+    boundaries: List[Boundary] = []
+    for (a, b), d in pair_data.items():
+        confs = np.asarray(d["confs"], dtype=np.float64)
+        diheds = np.asarray(d["diheds"], dtype=np.float64)
+        mean_c = float(confs.mean())
+        boundaries.append(Boundary(
+            region_a=a,
+            region_b=b,
+            proxy_edge_count=int(confs.shape[0]),
+            mean_confidence=mean_c,
+            max_confidence=float(confs.max()),
+            mean_dihedral_deg=float(diheds.mean()),
+            sharp=mean_c >= SHARP_BOUNDARY_THRESHOLD,
+        ))
+    boundaries.sort(key=lambda x: (x.region_a, x.region_b))
+    return boundaries

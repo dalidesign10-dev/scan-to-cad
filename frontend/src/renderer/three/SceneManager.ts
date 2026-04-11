@@ -8,6 +8,13 @@ import { renderEdgeCurves, clearEdgeCurves, EdgeCurve } from './EdgeCurves'
 import { renderCadPreview, clearCadPreview } from './CadPreview'
 import { renderPolyhedralCad, clearPolyhedralCad } from './PolyhedralCad'
 import { renderPoint2Cyl, clearPoint2Cyl, P2CResult } from './Point2CylOverlay'
+import {
+  IntentOverlayPayload,
+  applyIntentRegionColors,
+  renderIntentGizmos,
+  renderIntentSharpEdges,
+  clearIntentGizmos,
+} from './IntentOverlay'
 import type { PrimitiveResult } from '../store/pipelineStore'
 
 export class SceneManager {
@@ -25,7 +32,10 @@ export class SceneManager {
   private polyhedralCadGroup: THREE.Group
   private pickedPointsGroup: THREE.Group
   private point2cylGroup: THREE.Group
+  private intentGizmoGroup: THREE.Group
   private currentMesh: THREE.Mesh | null = null
+  private currentIntentPayload: IntentOverlayPayload | null = null
+  private intentRegionColorsActive: boolean = false
   private pendingLabelsUrl: string | null = null
   private currentPatches: any[] | null = null
   private currentLabels: Int32Array | null = null
@@ -83,6 +93,9 @@ export class SceneManager {
     this.scene.add(this.pickedPointsGroup)
     this.point2cylGroup = new THREE.Group()
     this.scene.add(this.point2cylGroup)
+    this.intentGizmoGroup = new THREE.Group()
+    this.intentGizmoGroup.visible = false
+    this.scene.add(this.intentGizmoGroup)
 
     const resizeObserver = new ResizeObserver(() => this.handleResize())
     resizeObserver.observe(container)
@@ -279,6 +292,42 @@ export class SceneManager {
 
   setPoint2CylVisible(v: boolean) {
     this.point2cylGroup.visible = v
+  }
+
+  /** Set the current intent overlay payload from the backend.
+   *  Stores it so the user can toggle region-colour and gizmo visibility
+   *  independently. */
+  setIntentOverlay(payload: IntentOverlayPayload | null) {
+    this.currentIntentPayload = payload
+    clearIntentGizmos(this.intentGizmoGroup)
+    if (!payload) return
+    // Compute scene scale from the current mesh bbox so gizmo lines don't
+    // get lost on small parts.
+    let scale = 100
+    if (this.currentMesh) {
+      const box = new THREE.Box3().setFromObject(this.currentMesh)
+      const size = box.getSize(new THREE.Vector3())
+      scale = Math.max(size.x, size.y, size.z) || 100
+    }
+    renderIntentGizmos(this.intentGizmoGroup, payload, scale)
+    renderIntentSharpEdges(this.intentGizmoGroup, payload)
+    if (this.intentRegionColorsActive && this.currentMesh) {
+      applyIntentRegionColors(this.currentMesh, payload)
+    }
+  }
+
+  setIntentRegionColors(active: boolean) {
+    this.intentRegionColorsActive = active
+    if (active && this.currentMesh && this.currentIntentPayload) {
+      applyIntentRegionColors(this.currentMesh, this.currentIntentPayload)
+    } else if (!active && this.currentMesh && this.currentLabels) {
+      // Restore the regular segmentation overlay coloring.
+      recolorOverlay(this.currentMesh, this.currentOverlayOptions)
+    }
+  }
+
+  setIntentGizmosVisible(v: boolean) {
+    this.intentGizmoGroup.visible = v
   }
 
   showEdgeCurves(edges: EdgeCurve[]) {
