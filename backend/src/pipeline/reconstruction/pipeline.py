@@ -438,6 +438,10 @@ def _split_high_cores(
             continue
         if r.fit.type not in (PrimitiveType.PLANE, PrimitiveType.CYLINDER, PrimitiveType.CONE):
             continue
+        # Skip regions fully drained by prior expansion passes — the
+        # second split-pass can see empty regions and np.ptp chokes on them.
+        if len(r.full_face_indices) < min_region_faces:
+            continue
 
         region_bbox = float(np.linalg.norm(
             np.ptp(full_vertices[np.unique(full_faces[r.full_face_indices].flatten())], axis=0)))
