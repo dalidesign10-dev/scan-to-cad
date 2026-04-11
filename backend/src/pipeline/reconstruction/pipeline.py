@@ -248,6 +248,11 @@ def run_intent_segmentation(
         if new_high_area - prev_high_area < 0.001:
             break
 
+    if progress_callback:
+        progress_callback("intent", 98, "Grouping HIGH fits into surface families...")
+
+    _assign_surface_families(regions, mesh_bbox_diag)
+
     metrics = {
         "elapsed_sec": float(time.time() - t0),
         "target_proxy_faces": int(target_proxy),
@@ -380,6 +385,132 @@ def _face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     norms = np.linalg.norm(cross, axis=1, keepdims=True)
     return cross / np.maximum(norms, 1e-12)
+
+
+# Surface-family grouping tolerances. Expressed relative to the mesh
+# bbox diagonal so the same thresholds work on small and large parts.
+# These are deliberately tight — two planes in the same family should
+# be genuinely coplanar (not just parallel), and two cylinders in the
+# same family should be genuinely coaxial (same line, same radius).
+_FAMILY_ANGLE_TOL_DEG = 2.0
+_FAMILY_D_TOL_REL = 0.005        # plane offset, % of bbox diag
+_FAMILY_LINE_TOL_REL = 0.01      # cyl/cone axis-line miss distance, % of bbox diag
+_FAMILY_RADIUS_TOL_REL = 0.02    # cyl radius match, % of bbox diag
+_FAMILY_HALF_ANGLE_TOL_DEG = 3.0
+_FAMILY_APEX_TOL_REL = 0.02      # cone apex match, % of bbox diag
+
+
+def _assign_surface_families(regions: dict, mesh_bbox_diag: float) -> None:
+    """Assign `surface_family_id` to every region in-place.
+
+    HIGH fits that agree on the underlying analytic surface collapse to
+    the same family. A family is:
+      - plane:    parallel normals AND matching offset d (coplanar)
+      - cylinder: parallel axes, shared axis line, matching radius
+      - cone:     parallel axes, matching apex, matching half-angle
+
+    Non-HIGH fits and regions without a fit get singleton families so
+    every region has a well-defined family id for downstream indexing.
+
+    The pass is greedy first-fit clustering — good enough at the
+    current tolerances, and O(n²) on HIGH fits which is tiny (the
+    HIGH set is ~100 regions, not the full 300+).
+    """
+    cos_ang = float(np.cos(np.radians(_FAMILY_ANGLE_TOL_DEG)))
+    d_tol = _FAMILY_D_TOL_REL * mesh_bbox_diag
+    line_tol = _FAMILY_LINE_TOL_REL * mesh_bbox_diag
+    radius_tol = _FAMILY_RADIUS_TOL_REL * mesh_bbox_diag
+    apex_tol = _FAMILY_APEX_TOL_REL * mesh_bbox_diag
+
+    # Cluster representatives per primitive type. Each entry is
+    # (type, *params). We keep them typed so cross-type comparisons
+    # never happen — a plane family can never merge with a cone family
+    # even if their directions match.
+    plane_reps = []   # list of (normal_np, d_float, family_id)
+    cyl_reps = []     # list of (axis_np, center_np, radius_float, family_id)
+    cone_reps = []    # list of (axis_np, apex_np, half_angle_deg, family_id)
+    next_family_id = 0
+
+    # Pass 1: assign HIGH fits, reusing existing family ids where a match
+    # is found. Iterate in descending area so the largest region becomes
+    # the canonical representative for its family (stable and intuitive).
+    ordered = sorted(
+        regions.values(),
+        key=lambda r: -(r.area_fraction if r.fit is not None else 0.0),
+    )
+    for r in ordered:
+        if r.fit is None or r.fit.confidence_class != ConfidenceClass.HIGH:
+            continue
+
+        if r.fit.type == PrimitiveType.PLANE:
+            n = np.asarray(r.fit.params["normal"], dtype=np.float64)
+            d = float(r.fit.params["d"])
+            matched_fid = -1
+            for rep_n, rep_d, rep_fid in plane_reps:
+                dot = float(np.dot(n, rep_n))
+                if abs(dot) < cos_ang:
+                    continue
+                d_aligned = d if dot > 0 else -d
+                if abs(d_aligned - rep_d) <= d_tol:
+                    matched_fid = rep_fid
+                    break
+            if matched_fid < 0:
+                matched_fid = next_family_id
+                next_family_id += 1
+                plane_reps.append((n.copy(), d, matched_fid))
+            r.surface_family_id = matched_fid
+
+        elif r.fit.type == PrimitiveType.CYLINDER:
+            axis = np.asarray(r.fit.params["axis"], dtype=np.float64)
+            center = np.asarray(r.fit.params["center"], dtype=np.float64)
+            radius = float(r.fit.params["radius"])
+            matched_fid = -1
+            for rep_axis, rep_center, rep_radius, rep_fid in cyl_reps:
+                if abs(float(np.dot(axis, rep_axis))) < cos_ang:
+                    continue
+                # Line-to-line miss distance assuming parallel axes:
+                # project the center offset onto the plane perpendicular
+                # to the axis. Works even when the two axes point opposite
+                # directions because we only use the magnitude of perp.
+                off = center - rep_center
+                perp = off - np.dot(off, rep_axis) * rep_axis
+                if float(np.linalg.norm(perp)) > line_tol:
+                    continue
+                if abs(radius - rep_radius) > radius_tol:
+                    continue
+                matched_fid = rep_fid
+                break
+            if matched_fid < 0:
+                matched_fid = next_family_id
+                next_family_id += 1
+                cyl_reps.append((axis.copy(), center.copy(), radius, matched_fid))
+            r.surface_family_id = matched_fid
+
+        elif r.fit.type == PrimitiveType.CONE:
+            axis = np.asarray(r.fit.params["axis"], dtype=np.float64)
+            apex = np.asarray(r.fit.params["apex"], dtype=np.float64)
+            half_deg = float(r.fit.params["half_angle_deg"])
+            matched_fid = -1
+            for rep_axis, rep_apex, rep_half, rep_fid in cone_reps:
+                if abs(float(np.dot(axis, rep_axis))) < cos_ang:
+                    continue
+                if float(np.linalg.norm(apex - rep_apex)) > apex_tol:
+                    continue
+                if abs(half_deg - rep_half) > _FAMILY_HALF_ANGLE_TOL_DEG:
+                    continue
+                matched_fid = rep_fid
+                break
+            if matched_fid < 0:
+                matched_fid = next_family_id
+                next_family_id += 1
+                cone_reps.append((axis.copy(), apex.copy(), half_deg, matched_fid))
+            r.surface_family_id = matched_fid
+
+    # Pass 2: singleton families for everything else (non-HIGH, unknown).
+    for r in regions.values():
+        if r.surface_family_id < 0:
+            r.surface_family_id = next_family_id
+            next_family_id += 1
 
 
 def _build_face_adjacency(full_faces: np.ndarray) -> list:

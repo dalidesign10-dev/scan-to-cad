@@ -128,6 +128,13 @@ class Region:
     fit_proxy: Optional[PrimitiveFit] = None  # original proxy fit, kept for diagnostics
     forced_type: Optional[PrimitiveType] = None  # manual override (E0 stores only)
     excluded: bool = False             # manual "exclude bad area" flag
+    # Surface family id: regions whose HIGH fits agree on the underlying
+    # analytic surface get the same family id. For planes this means
+    # parallel normal + same offset d; for cylinders/cones it means
+    # coaxial (same axis + same line of support + same radius/half-angle).
+    # Singletons (and non-HIGH fits) get a unique family per region so
+    # downstream code can always index by family without checking None.
+    surface_family_id: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -140,6 +147,7 @@ class Region:
             "fit_proxy": self.fit_proxy.to_dict() if self.fit_proxy else None,
             "forced_type": self.forced_type.value if self.forced_type else None,
             "excluded": bool(self.excluded),
+            "surface_family_id": int(self.surface_family_id),
         }
 
 
@@ -248,6 +256,26 @@ class ReconstructionState:
         def _mean(lst):
             return float(np.mean(lst)) if lst else 0.0
 
+        # Surface family counts: how many distinct analytic surfaces the
+        # HIGH fits resolve to (multiple parallel planes on the same part
+        # can be separate regions but belong to one family because they
+        # share the same normal). Provides a crisper CAD-level count than
+        # raw region counts.
+        plane_families = set()
+        cyl_families = set()
+        cone_families = set()
+        for r in self.regions.values():
+            if r.fit is None or r.fit.confidence_class != ConfidenceClass.HIGH:
+                continue
+            if r.surface_family_id < 0:
+                continue
+            if r.fit.type == PrimitiveType.PLANE:
+                plane_families.add(r.surface_family_id)
+            elif r.fit.type == PrimitiveType.CYLINDER:
+                cyl_families.add(r.surface_family_id)
+            elif r.fit.type == PrimitiveType.CONE:
+                cone_families.add(r.surface_family_id)
+
         return {
             "n_regions": len(self.regions),
             "n_boundaries": len(self.boundaries),
@@ -255,6 +283,9 @@ class ReconstructionState:
             "n_high_cylinder_fits": int(n_high_cyl),
             "n_high_cone_fits": int(n_high_cone),
             "n_unknown_regions": int(n_unknown),
+            "n_plane_families": len(plane_families),
+            "n_cylinder_families": len(cyl_families),
+            "n_cone_families": len(cone_families),
             "mean_rmse_plane": _mean(residuals_by_class["plane"]),
             "mean_rmse_cylinder": _mean(residuals_by_class["cylinder"]),
             "mean_rmse_cone": _mean(residuals_by_class["cone"]),

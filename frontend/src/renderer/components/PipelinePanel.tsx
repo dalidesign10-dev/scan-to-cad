@@ -277,6 +277,12 @@ export function PipelinePanel() {
               {' '}<span style={{ color: '#f39c12' }}>{intentSummary.n_high_cone_fits ?? 0}</span> high cone,
               {' '}<span style={{ color: '#888' }}>{intentSummary.n_unknown_regions}</span> unknown
             </div>
+            <div style={{ color: '#888' }}>
+              surface families:
+              {' '}<span style={{ color: '#4ecca3' }}>{intentSummary.n_plane_families ?? 0}</span> plane,
+              {' '}<span style={{ color: '#e94560' }}>{intentSummary.n_cylinder_families ?? 0}</span> cyl,
+              {' '}<span style={{ color: '#f39c12' }}>{intentSummary.n_cone_families ?? 0}</span> cone
+            </div>
             <div>
               area-explained:
               {' '}<span style={{ color: '#feca57', fontWeight: 'bold' }}>

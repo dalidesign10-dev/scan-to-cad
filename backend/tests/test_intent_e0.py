@@ -296,6 +296,69 @@ def test_uneven_tessellation_not_overfragmented():
     )
 
 
+def test_surface_family_grouping_on_cube():
+    """A single box with stepped features produces multiple regions per
+    face family. The surface_family_id post-pass must collapse each
+    face family to a single family id.
+
+    Specifically: take two concentric boxes (outer shell + a raised
+    inner platform on the top face). The top of the outer box and the
+    top of the inner raised platform are parallel but NOT coplanar
+    (different d values), so they must be in DIFFERENT families. The
+    top, bottom, and four side faces of the outer shell each give one
+    family. Nested geometry like this is the canonical test for
+    "parallel but not coplanar" — a naive normal-only grouper would
+    merge them incorrectly.
+    """
+    outer = _dense_box((80.0, 80.0, 20.0), subdivisions=2)
+    inner = _dense_box((30.0, 30.0, 5.0), subdivisions=1)
+    inner.apply_translation([0.0, 0.0, 12.5])
+    mesh = trimesh.util.concatenate([outer, inner])
+    state = _run(mesh)
+    s = state.summary()
+
+    # At least 6 HIGH plane fits on the 6 outer box faces (the inner
+    # platform contributes more). Family count should stay >= 6 because
+    # the stepped top face produces a parallel-but-offset family.
+    assert s["n_high_plane_fits"] >= 6, (
+        f"expected ≥6 HIGH plane fits on stepped box, got {s['n_high_plane_fits']}"
+    )
+    assert s["n_plane_families"] >= 6, (
+        f"expected ≥6 plane families, got {s['n_plane_families']}"
+    )
+    # Two regions with the SAME family_id must have matching plane
+    # params (within tolerance). This is the invariant that justifies
+    # calling them one family.
+    from collections import defaultdict
+    fam_to_regions = defaultdict(list)
+    for r in state.regions.values():
+        if r.fit and r.fit.type == PrimitiveType.PLANE and r.fit.confidence_class == ConfidenceClass.HIGH:
+            fam_to_regions[r.surface_family_id].append(r)
+    for fid, rs in fam_to_regions.items():
+        if len(rs) < 2:
+            continue
+        ref = rs[0]
+        ref_n = np.asarray(ref.fit.params["normal"])
+        ref_d = float(ref.fit.params["d"])
+        for r in rs[1:]:
+            n = np.asarray(r.fit.params["normal"])
+            d = float(r.fit.params["d"])
+            dot = float(np.dot(n, ref_n))
+            # Must be parallel within family tolerance.
+            assert abs(dot) > 0.99, f"family {fid}: normals diverge (dot={dot:.3f})"
+            d_aligned = d if dot > 0 else -d
+            assert abs(d_aligned - ref_d) < 5.0, (
+                f"family {fid}: d values diverge ({d_aligned:.2f} vs {ref_d:.2f}) "
+                f"— parallel but not coplanar planes must be separate families"
+            )
+
+    # Every region must have a valid family id (no -1 leftovers).
+    for r in state.regions.values():
+        assert r.surface_family_id >= 0, (
+            f"region {r.id} has no surface_family_id (pass left -1)"
+        )
+
+
 def test_force_plane_override_takes_effect():
     """The force_plane override must actually change a region's fit.
 
@@ -591,6 +654,7 @@ ALL_TESTS = [
     ("partial_cylinder", test_partial_cylinder_is_cylinder),
     ("partial_cone", test_partial_cone_is_cone),
     ("uneven_tessellation", test_uneven_tessellation_not_overfragmented),
+    ("surface_family_grouping", test_surface_family_grouping_on_cube),
     ("fandisk_real_mesh", test_fandisk_real_mechanical_mesh),
     ("rocker_arm_freeform", test_rocker_arm_freeform_stays_honest),
     ("scanned11_raw_baseline", test_scanned11_raw_baseline),
