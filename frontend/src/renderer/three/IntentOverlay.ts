@@ -29,7 +29,7 @@ export interface IntentRegionInfo {
     direction: number[]
     radius?: number
     height?: number
-    half_angle?: number
+    half_angle_deg?: number
   }
 }
 
@@ -187,12 +187,16 @@ export function renderIntentGizmos(
       })
       group.add(new THREE.Line(geom, mat))
     } else if (r.gizmo.kind === 'cone_axis') {
-      // Cone axis: same visual as cylinder axis but with a slightly
-      // shorter line so the two classes can be told apart when they
-      // sit near each other in the viewport.
-      const a = o.clone().addScaledVector(d, -cylLen * 0.35)
-      const b = o.clone().addScaledVector(d, cylLen * 0.35)
-      const geom = new THREE.BufferGeometry().setFromPoints([a, b])
+      // Cone axis: origin is the apex (not a centerpoint). Draw from
+      // the apex outward along +direction so the line lives inside
+      // the cone rather than poking through the apex into empty space.
+      // Length is scaled by half-angle so wide cones get longer lines
+      // (they span more volume) and narrow cones stay short.
+      const halfDeg = r.gizmo.half_angle_deg ?? 30
+      const lenScale = 0.6 + 0.4 * Math.min(1, halfDeg / 45)
+      const tip = o.clone()
+      const base = o.clone().addScaledVector(d, cylLen * lenScale)
+      const geom = new THREE.BufferGeometry().setFromPoints([tip, base])
       const mat = new THREE.LineBasicMaterial({
         color: colorForRegion(r),
         depthTest: true,
