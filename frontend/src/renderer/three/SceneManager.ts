@@ -10,6 +10,7 @@ import { renderPolyhedralCad, clearPolyhedralCad } from './PolyhedralCad'
 import { renderPoint2Cyl, clearPoint2Cyl, P2CResult } from './Point2CylOverlay'
 import {
   IntentOverlayPayload,
+  IntentColorMode,
   applyIntentRegionColors,
   renderIntentGizmos,
   renderIntentSharpEdges,
@@ -36,6 +37,7 @@ export class SceneManager {
   private currentMesh: THREE.Mesh | null = null
   private currentIntentPayload: IntentOverlayPayload | null = null
   private intentRegionColorsActive: boolean = false
+  private intentColorMode: IntentColorMode = 'region'
   private pendingLabelsUrl: string | null = null
   private currentPatches: any[] | null = null
   private currentLabels: Int32Array | null = null
@@ -309,20 +311,38 @@ export class SceneManager {
       const size = box.getSize(new THREE.Vector3())
       scale = Math.max(size.x, size.y, size.z) || 100
     }
-    renderIntentGizmos(this.intentGizmoGroup, payload, scale)
+    renderIntentGizmos(this.intentGizmoGroup, payload, scale, this.intentColorMode)
     renderIntentSharpEdges(this.intentGizmoGroup, payload)
     if (this.intentRegionColorsActive && this.currentMesh) {
-      applyIntentRegionColors(this.currentMesh, payload)
+      applyIntentRegionColors(this.currentMesh, payload, this.intentColorMode)
     }
   }
 
   setIntentRegionColors(active: boolean) {
     this.intentRegionColorsActive = active
     if (active && this.currentMesh && this.currentIntentPayload) {
-      applyIntentRegionColors(this.currentMesh, this.currentIntentPayload)
+      applyIntentRegionColors(this.currentMesh, this.currentIntentPayload, this.intentColorMode)
     } else if (!active && this.currentMesh && this.currentLabels) {
       // Restore the regular segmentation overlay coloring.
       recolorOverlay(this.currentMesh, this.currentOverlayOptions)
+    }
+  }
+
+  setIntentColorMode(mode: IntentColorMode) {
+    if (mode === this.intentColorMode) return
+    this.intentColorMode = mode
+    // Re-render whatever is currently shown using the new mode.
+    if (!this.currentIntentPayload) return
+    let scale = 100
+    if (this.currentMesh) {
+      const box = new THREE.Box3().setFromObject(this.currentMesh)
+      const size = box.getSize(new THREE.Vector3())
+      scale = Math.max(size.x, size.y, size.z) || 100
+    }
+    renderIntentGizmos(this.intentGizmoGroup, this.currentIntentPayload, scale, mode)
+    renderIntentSharpEdges(this.intentGizmoGroup, this.currentIntentPayload)
+    if (this.intentRegionColorsActive && this.currentMesh) {
+      applyIntentRegionColors(this.currentMesh, this.currentIntentPayload, mode)
     }
   }
 

@@ -115,6 +115,7 @@ export function PipelinePanel() {
     runIntentSegmentation, intentSummary, intentRegions,
     showIntentRegionColors, toggleIntentRegionColors,
     showIntentGizmos, toggleIntentGizmos,
+    intentColorMode, setIntentColorMode,
   } = usePipelineStore()
 
   const [brepTarget, setBrepTarget] = useState(2000)
@@ -319,6 +320,19 @@ export function PipelinePanel() {
               />
               Show axes / normals / sharp edges
             </label>
+            <div style={styles.paramRow}>
+              <span>Color / gizmo by</span>
+              <select
+                style={styles.input}
+                value={intentColorMode}
+                onChange={(e) =>
+                  setIntentColorMode(e.target.value as 'region' | 'family')
+                }
+              >
+                <option value="region">region</option>
+                <option value="family">family</option>
+              </select>
+            </div>
           </>
         )}
       </StepCard>

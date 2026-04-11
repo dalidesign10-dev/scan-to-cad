@@ -364,7 +364,47 @@ def get_intent_overlays(session) -> dict:
             "rmse": fit.rmse if fit else 0.0,
             "n_full_faces": int(r.full_face_indices.shape[0]),
             "area_fraction": r.area_fraction,
+            "surface_family_id": int(r.surface_family_id),
             "gizmo": gizmo,
+        })
+
+    # Surface families: one entry per canonical analytic surface. Gizmos
+    # are built from canonical_params so a family of 20 parallel planes
+    # ships one normal instead of 20 stacked on top of each other.
+    family_overlays = []
+    for fam in sorted(state.surface_families.values(), key=lambda f: f.id):
+        fam_gizmo = None
+        cp = fam.canonical_params or {}
+        if fam.type == PrimitiveType.PLANE and "normal" in cp:
+            fam_gizmo = {
+                "kind": "plane_normal",
+                "origin": cp.get("centroid", [0.0, 0.0, 0.0]),
+                "direction": cp["normal"],
+            }
+        elif fam.type == PrimitiveType.CYLINDER and "axis" in cp:
+            fam_gizmo = {
+                "kind": "cylinder_axis",
+                "origin": cp["center"],
+                "direction": cp["axis"],
+                "radius": cp["radius"],
+                "height": cp.get("height", 0.0),
+            }
+        elif fam.type == PrimitiveType.CONE and "axis" in cp:
+            fam_gizmo = {
+                "kind": "cone_axis",
+                "origin": cp["apex"],
+                "direction": cp["axis"],
+                "half_angle_deg": cp["half_angle_deg"],
+                "height": cp.get("height", 0.0),
+            }
+        family_overlays.append({
+            "id": int(fam.id),
+            "type": fam.type.value,
+            "region_ids": [int(rid) for rid in fam.region_ids],
+            "representative_region_id": int(fam.representative_region_id),
+            "total_area_fraction": float(fam.total_area_fraction),
+            "n_members": int(len(fam.region_ids)),
+            "gizmo": fam_gizmo,
         })
 
     return {
@@ -372,6 +412,7 @@ def get_intent_overlays(session) -> dict:
         "n_full_faces": int(state.full_face_region.shape[0]) if state.full_face_region is not None else 0,
         "full_face_region_b64": _encode_int32(state.full_face_region) if state.full_face_region is not None else None,
         "regions": region_overlays,
+        "surface_families": family_overlays,
         "sharp_edges": sharp_edges,
         "summary": state.summary(),
     }

@@ -83,6 +83,7 @@ interface PipelineState {
   intentOverlay: any | null
   showIntentRegionColors: boolean
   showIntentGizmos: boolean
+  intentColorMode: 'region' | 'family'
 
   setProgress: (p: { stage: string; pct: number; message: string } | null) => void
   setSelectedPatch: (id: number | null) => void
@@ -128,6 +129,7 @@ interface PipelineState {
   runIntentSegmentation: (params?: any) => Promise<void>
   toggleIntentRegionColors: () => void
   toggleIntentGizmos: () => void
+  setIntentColorMode: (mode: 'region' | 'family') => void
 }
 
 function extractFilename(transferPath: string): string {
@@ -193,6 +195,7 @@ export const usePipelineStore = create<PipelineState>((set) => ({
   intentOverlay: null,
   showIntentRegionColors: false,
   showIntentGizmos: false,
+  intentColorMode: 'region',
 
   setProgress: (p) => set({ progress: p }),
   setSelectedPatch: (id) => set({ selectedPatchId: id }),
@@ -894,4 +897,5 @@ export const usePipelineStore = create<PipelineState>((set) => ({
 
   toggleIntentRegionColors: () => set((s) => ({ showIntentRegionColors: !s.showIntentRegionColors })),
   toggleIntentGizmos: () => set((s) => ({ showIntentGizmos: !s.showIntentGizmos })),
+  setIntentColorMode: (mode) => set({ intentColorMode: mode }),
 }))

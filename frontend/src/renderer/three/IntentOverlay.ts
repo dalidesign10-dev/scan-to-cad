@@ -15,6 +15,15 @@ import * as THREE from 'three'
  * workflow keeps working.
  */
 
+export interface IntentGizmo {
+  kind: 'plane_normal' | 'cylinder_axis' | 'cone_axis'
+  origin: number[]
+  direction: number[]
+  radius?: number
+  height?: number
+  half_angle_deg?: number
+}
+
 export interface IntentRegionInfo {
   id: number
   type: 'plane' | 'cylinder' | 'cone' | 'unknown'
@@ -23,14 +32,19 @@ export interface IntentRegionInfo {
   rmse: number
   n_full_faces: number
   area_fraction: number
-  gizmo: null | {
-    kind: 'plane_normal' | 'cylinder_axis' | 'cone_axis'
-    origin: number[]
-    direction: number[]
-    radius?: number
-    height?: number
-    half_angle_deg?: number
-  }
+  // -1 when the pipeline didn't assign a family (non-HIGH or rejected).
+  surface_family_id: number
+  gizmo: null | IntentGizmo
+}
+
+export interface IntentSurfaceFamilyInfo {
+  id: number
+  type: 'plane' | 'cylinder' | 'cone' | 'unknown'
+  region_ids: number[]
+  representative_region_id: number
+  total_area_fraction: number
+  n_members: number
+  gizmo: null | IntentGizmo
 }
 
 export interface IntentSharpEdges {
@@ -45,9 +59,12 @@ export interface IntentOverlayPayload {
   n_full_faces: number
   full_face_region_b64: string | null
   regions: IntentRegionInfo[]
+  surface_families?: IntentSurfaceFamilyInfo[]
   sharp_edges: IntentSharpEdges | null
   summary: any
 }
+
+export type IntentColorMode = 'region' | 'family'
 
 const COLOR_PLANE_HIGH = new THREE.Color(0x4ecca3)
 const COLOR_PLANE_MED = new THREE.Color(0x2a8a6e)
@@ -84,6 +101,41 @@ function colorForRegion(r: IntentRegionInfo): THREE.Color {
   return COLOR_UNKNOWN
 }
 
+/**
+ * Deterministic colour for a surface family id. The golden-ratio hue
+ * stride gives well-separated colours for adjacent ids, and the family
+ * TYPE controls saturation/lightness so plane families stay greenish,
+ * cylinder families reddish, and cone families amber — the eye still
+ * reads type first, family id second.
+ */
+const _familyColorCache = new Map<string, THREE.Color>()
+function colorForFamily(
+  familyId: number,
+  type: 'plane' | 'cylinder' | 'cone' | 'unknown',
+): THREE.Color {
+  const key = `${type}:${familyId}`
+  const hit = _familyColorCache.get(key)
+  if (hit) return hit
+  const GOLDEN = 0.61803398875
+  // Hue anchor per type so each family type lives in its own arc of
+  // colour wheel. Plane ≈ green, cylinder ≈ red, cone ≈ amber.
+  let baseHue = 0.0
+  let sat = 0.55
+  let light = 0.55
+  if (type === 'plane') { baseHue = 0.42; sat = 0.55; light = 0.55 }
+  else if (type === 'cylinder') { baseHue = 0.97; sat = 0.60; light = 0.55 }
+  else if (type === 'cone') { baseHue = 0.09; sat = 0.65; light = 0.55 }
+  else { baseHue = 0.7; sat = 0.20; light = 0.40 }
+  // Spread ids across a narrow arc centred on baseHue so the type is
+  // still recognisable at a glance.
+  const arc = 0.08
+  const offset = ((familyId * GOLDEN) % 1) * 2 - 1  // [-1, 1]
+  const hue = (baseHue + offset * arc + 1) % 1
+  const col = new THREE.Color().setHSL(hue, sat, light)
+  _familyColorCache.set(key, col)
+  return col
+}
+
 function decodeInt32B64(b64: string): Int32Array {
   const bin = atob(b64)
   const len = bin.length
@@ -98,10 +150,18 @@ function decodeInt32B64(b64: string): Int32Array {
  * Reuses the same non-indexed BufferGeometry the SegmentationOverlay set
  * up. Required: the overlay has already been built (mesh.geometry has
  * userData.isSegmentationOverlay).
+ *
+ * In 'region' mode (default) each face is tinted by its region's type +
+ * confidence. In 'family' mode faces are tinted by the surface family
+ * they belong to — two physically separate pads on the same plane get
+ * the same colour, so coplanarity is visible at a glance. Regions that
+ * have no family (family_id < 0, i.e. non-HIGH) fall back to the
+ * region-colour path so the user still sees MED/LOW fits.
  */
 export function applyIntentRegionColors(
   mesh: THREE.Mesh,
   payload: IntentOverlayPayload,
+  mode: IntentColorMode = 'region',
 ) {
   const geometry = mesh.geometry as THREE.BufferGeometry
   if (!geometry.userData?.isSegmentationOverlay) {
@@ -125,7 +185,14 @@ export function applyIntentRegionColors(
   for (let fi = 0; fi < nFaces; fi++) {
     const rid = faceRegion[fi]
     const r = regionById.get(rid)
-    const c = r ? colorForRegion(r) : COLOR_UNKNOWN
+    let c: THREE.Color
+    if (!r) {
+      c = COLOR_UNKNOWN
+    } else if (mode === 'family' && r.surface_family_id >= 0) {
+      c = colorForFamily(r.surface_family_id, r.type)
+    } else {
+      c = colorForRegion(r)
+    }
     for (let vi = 0; vi < 3; vi++) {
       const dst = (fi * 3 + vi) * 3
       colors[dst + 0] = c.r
@@ -150,59 +217,87 @@ export function clearIntentGizmos(group: THREE.Group) {
 }
 
 /**
+ * Internal: draw one gizmo line. Shared by the region and family paths
+ * so the geometry choice (plane short line, cylinder axis, cone apex
+ * cone) stays consistent between modes.
+ */
+function _drawGizmoLine(
+  group: THREE.Group,
+  gz: IntentGizmo,
+  color: THREE.Color,
+  sceneScale: number,
+) {
+  const planeLen = sceneScale * 0.06
+  const cylLen = sceneScale * 0.45
+  const o = new THREE.Vector3(gz.origin[0], gz.origin[1], gz.origin[2])
+  const d = new THREE.Vector3(gz.direction[0], gz.direction[1], gz.direction[2]).normalize()
+  const mat = new THREE.LineBasicMaterial({ color, depthTest: true })
+
+  if (gz.kind === 'plane_normal') {
+    const end = o.clone().addScaledVector(d, planeLen)
+    const geom = new THREE.BufferGeometry().setFromPoints([o, end])
+    group.add(new THREE.Line(geom, mat))
+  } else if (gz.kind === 'cylinder_axis') {
+    const a = o.clone().addScaledVector(d, -cylLen * 0.5)
+    const b = o.clone().addScaledVector(d, cylLen * 0.5)
+    const geom = new THREE.BufferGeometry().setFromPoints([a, b])
+    group.add(new THREE.Line(geom, mat))
+  } else if (gz.kind === 'cone_axis') {
+    // Cone axis: origin is the apex (not a centerpoint). Draw from
+    // the apex outward along +direction so the line lives inside
+    // the cone rather than poking through the apex into empty space.
+    // Length is scaled by half-angle so wide cones get longer lines
+    // (they span more volume) and narrow cones stay short.
+    const halfDeg = gz.half_angle_deg ?? 30
+    const lenScale = 0.6 + 0.4 * Math.min(1, halfDeg / 45)
+    const tip = o.clone()
+    const base = o.clone().addScaledVector(d, cylLen * lenScale)
+    const geom = new THREE.BufferGeometry().setFromPoints([tip, base])
+    group.add(new THREE.Line(geom, mat))
+  }
+}
+
+/**
  * Render gizmos: plane normals as short lines + dots, cylinder axes as
  * long lines passing through the origin. Confidence class controls color
  * saturation; only high/medium are drawn (low fits would just be noise).
+ *
+ * In 'family' mode one gizmo is drawn per SurfaceFamily (using the
+ * family's canonical params) instead of one per region, so 20 parallel
+ * planes collapse to a single arrow instead of stacking on top of each
+ * other. Regions whose fit didn't land in a family (non-HIGH) still get
+ * their own gizmo so MED fits remain visible.
  */
 export function renderIntentGizmos(
   group: THREE.Group,
   payload: IntentOverlayPayload,
   sceneScale: number,
+  mode: IntentColorMode = 'region',
 ) {
   clearIntentGizmos(group)
-  const planeLen = sceneScale * 0.06
-  const cylLen = sceneScale * 0.45
+
+  if (mode === 'family' && payload.surface_families && payload.surface_families.length > 0) {
+    // One gizmo per family, using canonical params.
+    for (const fam of payload.surface_families) {
+      if (!fam.gizmo) continue
+      const color = colorForFamily(fam.id, fam.type)
+      _drawGizmoLine(group, fam.gizmo, color, sceneScale)
+    }
+    // Also show MED region gizmos that have no family — otherwise the
+    // user would lose sight of the "second-tier" fits entirely.
+    for (const r of payload.regions) {
+      if (!r.gizmo) continue
+      if (r.surface_family_id >= 0) continue
+      if (r.confidence_class !== 'medium') continue
+      _drawGizmoLine(group, r.gizmo, colorForRegion(r), sceneScale)
+    }
+    return
+  }
 
   for (const r of payload.regions) {
     if (!r.gizmo) continue
     if (r.confidence_class !== 'high' && r.confidence_class !== 'medium') continue
-    const o = new THREE.Vector3(r.gizmo.origin[0], r.gizmo.origin[1], r.gizmo.origin[2])
-    const d = new THREE.Vector3(r.gizmo.direction[0], r.gizmo.direction[1], r.gizmo.direction[2]).normalize()
-
-    if (r.gizmo.kind === 'plane_normal') {
-      const end = o.clone().addScaledVector(d, planeLen)
-      const geom = new THREE.BufferGeometry().setFromPoints([o, end])
-      const mat = new THREE.LineBasicMaterial({
-        color: colorForRegion(r),
-        depthTest: true,
-      })
-      group.add(new THREE.Line(geom, mat))
-    } else if (r.gizmo.kind === 'cylinder_axis') {
-      const a = o.clone().addScaledVector(d, -cylLen * 0.5)
-      const b = o.clone().addScaledVector(d, cylLen * 0.5)
-      const geom = new THREE.BufferGeometry().setFromPoints([a, b])
-      const mat = new THREE.LineBasicMaterial({
-        color: colorForRegion(r),
-        depthTest: true,
-      })
-      group.add(new THREE.Line(geom, mat))
-    } else if (r.gizmo.kind === 'cone_axis') {
-      // Cone axis: origin is the apex (not a centerpoint). Draw from
-      // the apex outward along +direction so the line lives inside
-      // the cone rather than poking through the apex into empty space.
-      // Length is scaled by half-angle so wide cones get longer lines
-      // (they span more volume) and narrow cones stay short.
-      const halfDeg = r.gizmo.half_angle_deg ?? 30
-      const lenScale = 0.6 + 0.4 * Math.min(1, halfDeg / 45)
-      const tip = o.clone()
-      const base = o.clone().addScaledVector(d, cylLen * lenScale)
-      const geom = new THREE.BufferGeometry().setFromPoints([tip, base])
-      const mat = new THREE.LineBasicMaterial({
-        color: colorForRegion(r),
-        depthTest: true,
-      })
-      group.add(new THREE.Line(geom, mat))
-    }
+    _drawGizmoLine(group, r.gizmo, colorForRegion(r), sceneScale)
   }
 }
 
