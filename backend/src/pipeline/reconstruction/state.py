@@ -159,6 +159,12 @@ class Boundary:
     actually shared between the two regions. `mean_confidence` is the
     averaged hybrid sharp-edge score along the shared edges (0..1, higher
     means a more decisive boundary).
+
+    `edge_midpoints` stores the 3D midpoint of every proxy edge backing
+    this boundary (shape ``(proxy_edge_count, 3)``). The family-level
+    intersection pass uses them as the ground-truth "where on the mesh
+    does this boundary actually live" signal for tight adjacency checks
+    and for bracketing curved intersections to the relevant arc.
     """
     region_a: int
     region_b: int
@@ -167,6 +173,14 @@ class Boundary:
     max_confidence: float
     mean_dihedral_deg: float
     sharp: bool                        # mean_confidence above the sharp threshold
+    edge_midpoints: Optional[np.ndarray] = None  # (K, 3) float64
+
+    @property
+    def midpoint(self) -> Optional[np.ndarray]:
+        """Mean 3D position of backing proxy edges (None if not populated)."""
+        if self.edge_midpoints is None or self.edge_midpoints.size == 0:
+            return None
+        return self.edge_midpoints.mean(axis=0)
 
     def to_dict(self) -> dict:
         return {

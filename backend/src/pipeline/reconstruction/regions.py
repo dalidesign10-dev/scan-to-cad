@@ -1278,7 +1278,18 @@ def build_region_graph(
     labels: np.ndarray,
     signals: BoundarySignals,
 ) -> List[Boundary]:
-    """Aggregate edge-level signals into RegionGraph Boundary entries."""
+    """Aggregate edge-level signals into RegionGraph Boundary entries.
+
+    Besides the aggregate confidence/dihedral stats, we also stash the
+    3D midpoint of every proxy edge backing each boundary. The
+    family-level intersection pass reads them to:
+      - reject phantom family pairs whose sharp boundary lives far from
+        the analytic intersection curve, and
+      - bracket curved intersections (plane/cyl, plane/cone, cyl/cyl)
+        to the arc that actually sits on the part, not the full
+        infinite curve.
+    """
+    proxy_verts = signals.proxy.vertices
     pair_data: Dict[Tuple[int, int], Dict] = {}
     for ei in range(signals.n_edges):
         a = int(labels[signals.edge_face_pairs[ei, 0]])
@@ -1289,14 +1300,20 @@ def build_region_graph(
         d = pair_data.setdefault(key, {
             "confs": [],
             "diheds": [],
+            "mids": [],
         })
         d["confs"].append(float(signals.confidence[ei]))
         d["diheds"].append(float(signals.dihedral_deg[ei]))
+        v0, v1 = signals.edge_vertex_pairs[ei]
+        d["mids"].append(
+            0.5 * (proxy_verts[int(v0)] + proxy_verts[int(v1)])
+        )
 
     boundaries: List[Boundary] = []
     for (a, b), d in pair_data.items():
         confs = np.asarray(d["confs"], dtype=np.float64)
         diheds = np.asarray(d["diheds"], dtype=np.float64)
+        mids = np.asarray(d["mids"], dtype=np.float64)
         mean_c = float(confs.mean())
         boundaries.append(Boundary(
             region_a=a,
@@ -1306,6 +1323,7 @@ def build_region_graph(
             max_confidence=float(confs.max()),
             mean_dihedral_deg=float(diheds.mean()),
             sharp=mean_c >= SHARP_BOUNDARY_THRESHOLD,
+            edge_midpoints=mids,
         ))
     boundaries.sort(key=lambda x: (x.region_a, x.region_b))
     return boundaries
