@@ -29,6 +29,9 @@ from .state import (
     ConfidenceClass,
 )
 from .pipeline import run_intent_segmentation, get_intent_state, get_intent_overlays
+from .snap import snap_mesh_to_analytics, SnapResult
+from .trim import construct_trimmed_faces, get_trim_summary
+from .brep import build_step_from_trimmed_faces
 
 __all__ = [
     "ReconstructionState",
@@ -42,4 +45,9 @@ __all__ = [
     "run_intent_segmentation",
     "get_intent_state",
     "get_intent_overlays",
+    "snap_mesh_to_analytics",
+    "SnapResult",
+    "construct_trimmed_faces",
+    "get_trim_summary",
+    "build_step_from_trimmed_faces",
 ]

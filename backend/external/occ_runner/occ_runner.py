@@ -19,10 +19,13 @@ import tempfile
 import numpy as np
 import trimesh
 
-from OCC.Core.gp import gp_Pnt
+from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax3, gp_Pln
+from OCC.Core.Geom import Geom_CylindricalSurface, Geom_ConicalSurface
 from OCC.Core.BRepBuilderAPI import (
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakePolygon,
+    BRepBuilderAPI_MakeWire,
+    BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_Sewing,
     BRepBuilderAPI_MakeSolid,
 )
@@ -336,6 +339,178 @@ def op_export(req):
     return {"output_path": out_path, "format": fmt, "size": os.path.getsize(out_path)}
 
 
+def op_build_trimmed(req):
+    """Build analytic B-Rep faces from trimmed face data and export as STEP.
+
+    Input: {
+        "op": "build_trimmed",
+        "faces": [{
+            "surface_type": "plane"|"cylinder"|"cone",
+            "surface_params": {...},
+            "outer_loop": [[x,y,z], ...],
+            "inner_loops": [[[x,y,z], ...], ...]
+        }, ...],
+        "out_brep": "/path/to/output.brep",
+        "out_step": "/path/to/output.step"
+    }
+    """
+    import math as _math
+    from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeCone
+    from OCC.Core.gp import gp_Ax2
+    from OCC.Core.TopoDS import TopoDS_Compound
+
+    faces_data = req["faces"]
+    out_brep = req["out_brep"]
+    out_step = req["out_step"]
+
+    builder = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+
+    n_built = 0
+    n_failed = 0
+    MIN_EDGE_LEN = 1e-4
+
+    for i, fd in enumerate(faces_data):
+        try:
+            stype = fd["surface_type"]
+            params = fd["surface_params"]
+            outer_loop = fd["outer_loop"]
+
+            if stype == "plane":
+                # Build plane face from boundary wire
+                normal = params["normal"]
+                d_val = params.get("d", 0.0)
+                if "centroid" in params:
+                    pt = params["centroid"]
+                else:
+                    pt = [-d_val * normal[0], -d_val * normal[1], -d_val * normal[2]]
+                surface = gp_Pln(
+                    gp_Pnt(float(pt[0]), float(pt[1]), float(pt[2])),
+                    gp_Dir(float(normal[0]), float(normal[1]), float(normal[2])),
+                )
+                wire_builder = BRepBuilderAPI_MakeWire()
+                ne = 0
+                for j in range(len(outer_loop)):
+                    a = outer_loop[j]
+                    b = outer_loop[(j + 1) % len(outer_loop)]
+                    dx = float(b[0]-a[0]); dy = float(b[1]-a[1]); dz = float(b[2]-a[2])
+                    if (dx*dx + dy*dy + dz*dz) < MIN_EDGE_LEN * MIN_EDGE_LEN:
+                        continue
+                    me = BRepBuilderAPI_MakeEdge(
+                        gp_Pnt(float(a[0]), float(a[1]), float(a[2])),
+                        gp_Pnt(float(b[0]), float(b[1]), float(b[2])),
+                    )
+                    if me.IsDone():
+                        wire_builder.Add(me.Edge())
+                        ne += 1
+                if ne < 3:
+                    raise ValueError(f"Too few edges ({ne})")
+                face = BRepBuilderAPI_MakeFace(surface, wire_builder.Wire(), True)
+                if not face.IsDone():
+                    raise RuntimeError("MakeFace failed")
+                builder.Add(compound, face.Face())
+                n_built += 1
+
+            elif stype == "cylinder":
+                # Use BRepPrimAPI for a proper cylinder solid
+                center = [float(x) for x in params["center"]]
+                axis = [float(x) for x in params["axis"]]
+                radius = float(params["radius"])
+                # Compute height from boundary loop extent along axis
+                import numpy as _np
+                pts = _np.array(outer_loop, dtype=float)
+                projections = (pts - center) @ _np.array(axis)
+                h_min, h_max = float(projections.min()), float(projections.max())
+                height = max(h_max - h_min, 0.1)
+                # Shift center to bottom of cylinder
+                base = [center[k] + h_min * axis[k] for k in range(3)]
+                ax2 = gp_Ax2(
+                    gp_Pnt(base[0], base[1], base[2]),
+                    gp_Dir(axis[0], axis[1], axis[2]),
+                )
+                cyl = BRepPrimAPI_MakeCylinder(ax2, radius, height)
+                builder.Add(compound, cyl.Shape())
+                n_built += 1
+
+            elif stype == "cone":
+                # Use BRepPrimAPI for a proper cone solid
+                apex = [float(x) for x in params["apex"]]
+                axis = [float(x) for x in params["axis"]]
+                if "half_angle_rad" in params:
+                    half_angle = float(params["half_angle_rad"])
+                elif "half_angle_deg" in params:
+                    half_angle = _math.radians(float(params["half_angle_deg"]))
+                else:
+                    raise KeyError("No half_angle in cone params")
+                # Compute extent from boundary loop
+                import numpy as _np
+                pts = _np.array(outer_loop, dtype=float)
+                projections = (pts - apex) @ _np.array(axis)
+                h_min, h_max = float(projections.min()), float(projections.max())
+                if h_min < 0.01:
+                    h_min = 0.01  # avoid apex singularity
+                r1 = h_min * _math.tan(half_angle)
+                r2 = h_max * _math.tan(half_angle)
+                height = h_max - h_min
+                if height < 0.01 or r1 < 0.001 or r2 < 0.001:
+                    raise ValueError(f"Degenerate cone: h={height:.3f} r1={r1:.3f} r2={r2:.3f}")
+                base = [apex[k] + h_min * axis[k] for k in range(3)]
+                ax2 = gp_Ax2(
+                    gp_Pnt(base[0], base[1], base[2]),
+                    gp_Dir(axis[0], axis[1], axis[2]),
+                )
+                cone = BRepPrimAPI_MakeCone(ax2, r1, r2, height)
+                builder.Add(compound, cone.Shape())
+                n_built += 1
+
+            else:
+                raise ValueError(f"Unknown surface type: {stype}")
+
+        except Exception as exc:
+            print(f"[build_trimmed] face {i} ({stype}) failed: {exc}", file=sys.stderr)
+            n_failed += 1
+            continue
+
+    if n_built == 0:
+        raise RuntimeError("All faces failed to build")
+
+    shape = compound
+
+    # --- 7. Export BREP ---
+    write_brep(shape, out_brep)
+
+    # --- 7b. Export STEP (redirect stdout to avoid OCC printf noise) ---
+    import os as _os
+    from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
+    from OCC.Core.IFSelect import IFSelect_RetDone
+
+    sys.stdout.flush()
+    saved_fd = _os.dup(1)
+    devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
+    try:
+        _os.dup2(devnull_fd, 1)
+        writer = STEPControl_Writer()
+        writer.Transfer(shape, STEPControl_AsIs)
+        status = writer.Write(out_step)
+    finally:
+        _os.dup2(saved_fd, 1)
+        _os.close(saved_fd)
+        _os.close(devnull_fd)
+    if status != IFSelect_RetDone:
+        raise RuntimeError("STEP export failed")
+
+    step_size = _os.path.getsize(out_step)
+
+    return {
+        "n_faces_built": n_built,
+        "n_faces_failed": n_failed,
+        "brep_path": out_brep,
+        "step_path": out_step,
+        "step_size": step_size,
+    }
+
+
 def main():
     try:
         req = json.loads(sys.stdin.read())
@@ -348,6 +523,8 @@ def main():
             res = op_fillet_or_chamfer(req, "chamfer")
         elif op == "export":
             res = op_export(req)
+        elif op == "build_trimmed":
+            res = op_build_trimmed(req)
         else:
             raise ValueError(f"Unknown op: {op}")
         sys.stdout.write(json.dumps({"ok": True, "result": res}))

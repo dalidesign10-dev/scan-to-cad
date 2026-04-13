@@ -1,13 +1,7 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { loadMeshFromBinaryFile } from './MeshLoader'
-import { applySegmentationOverlay, recolorOverlay, patchIdForFace, OverlayOptions } from './SegmentationOverlay'
-import { createPrimitiveGizmos, clearGizmos } from './PrimitiveGizmos'
-import { renderInfiniteSurfaces, clearInfiniteSurfaces, InfiniteSurface } from './InfiniteSurfaces'
-import { renderEdgeCurves, clearEdgeCurves, EdgeCurve } from './EdgeCurves'
-import { renderCadPreview, clearCadPreview } from './CadPreview'
-import { renderPolyhedralCad, clearPolyhedralCad } from './PolyhedralCad'
-import { renderPoint2Cyl, clearPoint2Cyl, P2CResult } from './Point2CylOverlay'
+import { applySegmentationOverlay, recolorOverlay, OverlayOptions } from './SegmentationOverlay'
 import {
   IntentOverlayPayload,
   IntentColorMode,
@@ -17,7 +11,6 @@ import {
   renderIntentFamilyEdges,
   clearIntentGizmos,
 } from './IntentOverlay'
-import type { PrimitiveResult } from '../store/pipelineStore'
 
 export class SceneManager {
   private scene: THREE.Scene
@@ -27,13 +20,6 @@ export class SceneManager {
   private container: HTMLElement
   private animationId: number = 0
   private meshGroup: THREE.Group
-  private gizmoGroup: THREE.Group
-  private infiniteSurfaceGroup: THREE.Group
-  private edgeGroup: THREE.Group
-  private cadPreviewGroup: THREE.Group
-  private polyhedralCadGroup: THREE.Group
-  private pickedPointsGroup: THREE.Group
-  private point2cylGroup: THREE.Group
   private intentGizmoGroup: THREE.Group
   private currentMesh: THREE.Mesh | null = null
   private currentIntentPayload: IntentOverlayPayload | null = null
@@ -49,7 +35,7 @@ export class SceneManager {
     this.container = container
 
     this.scene = new THREE.Scene()
-    this.scene.background = new THREE.Color(0x0a0a1a)
+    this.scene.background = new THREE.Color(0x111111)
 
     const aspect = container.clientWidth / container.clientHeight
     this.camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 10000)
@@ -75,27 +61,11 @@ export class SceneManager {
     dirLight2.position.set(-100, -50, -100)
     this.scene.add(dirLight2)
 
-    const grid = new THREE.GridHelper(500, 50, 0x222244, 0x111133)
+    const grid = new THREE.GridHelper(500, 50, 0x2a2a2a, 0x1a1a1a)
     this.scene.add(grid)
 
     this.meshGroup = new THREE.Group()
     this.scene.add(this.meshGroup)
-    this.gizmoGroup = new THREE.Group()
-    this.scene.add(this.gizmoGroup)
-    this.infiniteSurfaceGroup = new THREE.Group()
-    this.scene.add(this.infiniteSurfaceGroup)
-    this.edgeGroup = new THREE.Group()
-    this.scene.add(this.edgeGroup)
-    this.cadPreviewGroup = new THREE.Group()
-    this.cadPreviewGroup.visible = false
-    this.scene.add(this.cadPreviewGroup)
-    this.polyhedralCadGroup = new THREE.Group()
-    this.polyhedralCadGroup.visible = false
-    this.scene.add(this.polyhedralCadGroup)
-    this.pickedPointsGroup = new THREE.Group()
-    this.scene.add(this.pickedPointsGroup)
-    this.point2cylGroup = new THREE.Group()
-    this.scene.add(this.point2cylGroup)
     this.intentGizmoGroup = new THREE.Group()
     this.intentGizmoGroup.visible = false
     this.scene.add(this.intentGizmoGroup)
@@ -122,9 +92,7 @@ export class SceneManager {
 
   async loadMeshFromUrl(url: string) {
     this.meshGroup.clear()
-    this.gizmoGroup.clear()
     this.currentMesh = null
-    // Don't clear pendingLabelsUrl — we want it applied after mesh loads
 
     try {
       const response = await fetch(url)
@@ -195,108 +163,6 @@ export class SceneManager {
     }
   }
 
-  /** Update merge map / selection without re-fetching labels. */
-  updateOverlayOptions(opts: Partial<OverlayOptions>) {
-    this.currentOverlayOptions = { ...this.currentOverlayOptions, ...opts }
-    if (this.currentMesh && this.currentLabels) {
-      recolorOverlay(this.currentMesh, this.currentOverlayOptions)
-    }
-  }
-
-  /** Raycast and return the 3D hit point on the mesh, or null. */
-  pickPointAt(ndcX: number, ndcY: number): [number, number, number] | null {
-    if (!this.currentMesh) return null
-    this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera)
-    const hits = this.raycaster.intersectObject(this.currentMesh, false)
-    if (!hits.length) return null
-    const p = hits[0].point
-    return [p.x, p.y, p.z]
-  }
-
-  /** Update the picked-points marker overlay. */
-  showPickedPoints(points: number[][]) {
-    // Clear without disposing — markers reuse a fresh geometry each call below
-    while (this.pickedPointsGroup.children.length > 0) {
-      this.pickedPointsGroup.remove(this.pickedPointsGroup.children[0])
-    }
-    if (!points || points.length === 0) return
-    // Size relative to scene
-    const box = new THREE.Box3()
-    if (this.currentMesh) box.setFromObject(this.currentMesh)
-    const size = box.getSize(new THREE.Vector3())
-    const r = Math.max(size.x, size.y, size.z) * 0.012 || 1
-    const mat = new THREE.MeshBasicMaterial({ color: 0xff3355, depthTest: false })
-    const geom = new THREE.SphereGeometry(r, 12, 8)
-    for (const p of points) {
-      const m = new THREE.Mesh(geom, mat)
-      m.position.set(p[0], p[1], p[2])
-      m.renderOrder = 999
-      this.pickedPointsGroup.add(m)
-    }
-  }
-
-  /** Raycast a normalized device coordinate against the segmented mesh. */
-  pickPatchAt(ndcX: number, ndcY: number): number | null {
-    if (!this.currentMesh) return null
-    this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera)
-    const hits = this.raycaster.intersectObject(this.currentMesh, false)
-    if (!hits.length) return null
-    const hit = hits[0]
-    if (hit.faceIndex == null) return null
-    return patchIdForFace(this.currentMesh, hit.faceIndex)
-  }
-
-  showPrimitiveGizmos(primitives: PrimitiveResult[]) {
-    clearGizmos(this.gizmoGroup)
-    if (!primitives || primitives.length === 0) return
-    createPrimitiveGizmos(this.gizmoGroup, primitives)
-  }
-
-  showInfiniteSurfaces(surfaces: InfiniteSurface[]) {
-    clearInfiniteSurfaces(this.infiniteSurfaceGroup)
-    if (!surfaces || surfaces.length === 0) return
-    renderInfiniteSurfaces(this.infiniteSurfaceGroup, surfaces)
-  }
-
-  setInfiniteSurfacesVisible(visible: boolean) {
-    this.infiniteSurfaceGroup.visible = visible
-  }
-
-  showPolyhedralCad(data: { vertices: number[][]; faces: number[][] } | null) {
-    clearPolyhedralCad(this.polyhedralCadGroup)
-    if (!data) return
-    renderPolyhedralCad(this.polyhedralCadGroup, data)
-  }
-
-  setPolyhedralCadVisible(visible: boolean) {
-    this.polyhedralCadGroup.visible = visible
-    // When polyhedral CAD is on, hide everything else
-    this.meshGroup.visible = !visible
-    this.cadPreviewGroup.visible = !visible && this.cadPreviewGroup.visible
-  }
-
-  showCadPreview(surfaces: any[]) {
-    clearCadPreview(this.cadPreviewGroup)
-    if (!surfaces || surfaces.length === 0) return
-    renderCadPreview(this.cadPreviewGroup, surfaces)
-  }
-
-  setCadPreviewVisible(visible: boolean) {
-    this.cadPreviewGroup.visible = visible
-    // Hide the original noisy mesh when CAD preview is on
-    this.meshGroup.visible = !visible
-  }
-
-  showPoint2Cyl(result: P2CResult | null) {
-    clearPoint2Cyl(this.point2cylGroup)
-    if (!result) return
-    renderPoint2Cyl(this.point2cylGroup, result)
-  }
-
-  setPoint2CylVisible(v: boolean) {
-    this.point2cylGroup.visible = v
-  }
-
   /** Set the current intent overlay payload from the backend.
    *  Stores it so the user can toggle region-colour and gizmo visibility
    *  independently. */
@@ -353,10 +219,109 @@ export class SceneManager {
     this.intentGizmoGroup.visible = v
   }
 
-  showEdgeCurves(edges: EdgeCurve[]) {
-    clearEdgeCurves(this.edgeGroup)
-    if (!edges || edges.length === 0) return
-    renderEdgeCurves(this.edgeGroup, edges)
+  applyDeviationColors(faceColorsB64: string, nFaces: number) {
+    if (!this.currentMesh) return
+    const binary = atob(faceColorsB64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+
+    const geometry = this.currentMesh.geometry
+    const faceCount = geometry.index ? geometry.index.count / 3 : geometry.attributes.position.count / 3
+
+    // Create per-vertex color attribute
+    const positions = geometry.attributes.position
+    const colors = new Float32Array(positions.count * 3)
+
+    if (geometry.index) {
+        const index = geometry.index.array
+        for (let f = 0; f < Math.min(nFaces, faceCount); f++) {
+            const r = bytes[f * 3] / 255
+            const g = bytes[f * 3 + 1] / 255
+            const b = bytes[f * 3 + 2] / 255
+            for (let v = 0; v < 3; v++) {
+                const vi = index[f * 3 + v]
+                colors[vi * 3] = r
+                colors[vi * 3 + 1] = g
+                colors[vi * 3 + 2] = b
+            }
+        }
+    }
+
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    const mat = this.currentMesh.material as THREE.MeshPhongMaterial
+    mat.vertexColors = true
+    mat.color.setHex(0xffffff)
+    mat.needsUpdate = true
+    geometry.attributes.color.needsUpdate = true
+  }
+
+  clearDeviationColors() {
+    if (!this.currentMesh) return
+    const mat = this.currentMesh.material as THREE.MeshPhongMaterial
+    mat.vertexColors = false
+    mat.color.setHex(0x6688cc)
+    mat.needsUpdate = true
+  }
+
+  private reconstructGroup: THREE.Group = new THREE.Group()
+  private reconstructGroupAdded = false
+
+  /** Add a reconstructed surface to the viewport (called per-region during live reconstruction) */
+  addReconstructedSurface(vertices: number[][], faces: number[][], classification: string) {
+    if (!this.reconstructGroupAdded) {
+      this.scene.add(this.reconstructGroup)
+      this.reconstructGroupAdded = true
+    }
+
+    const geometry = new THREE.BufferGeometry()
+    const positions = new Float32Array(vertices.length * 3)
+    for (let i = 0; i < vertices.length; i++) {
+      positions[i * 3] = vertices[i][0]
+      positions[i * 3 + 1] = vertices[i][1]
+      positions[i * 3 + 2] = vertices[i][2]
+    }
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+
+    const indices: number[] = []
+    for (const f of faces) {
+      indices.push(f[0], f[1], f[2])
+    }
+    geometry.setIndex(indices)
+    geometry.computeVertexNormals()
+
+    // Color by classification type
+    const colorMap: Record<string, number> = {
+      PLANE: 0x4488cc,
+      CYLINDER: 0x44cc88,
+      CONE: 0xcc8844,
+      FILLET: 0x8844cc,
+      CHAMFER: 0xcccc44,
+    }
+    const color = colorMap[classification] ?? 0x888888
+
+    const material = new THREE.MeshPhongMaterial({
+      color,
+      specular: 0x333333,
+      shininess: 60,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.85,
+    })
+
+    const mesh = new THREE.Mesh(geometry, material)
+    this.reconstructGroup.add(mesh)
+  }
+
+  /** Clear all reconstructed surfaces */
+  clearReconstructedSurfaces() {
+    while (this.reconstructGroup.children.length > 0) {
+      const child = this.reconstructGroup.children[0]
+      this.reconstructGroup.remove(child)
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose()
+        ;(child.material as THREE.Material).dispose()
+      }
+    }
   }
 
   dispose() {

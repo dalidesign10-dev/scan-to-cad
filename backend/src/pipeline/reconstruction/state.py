@@ -249,6 +249,50 @@ class SurfaceFamily:
 
 
 @dataclass
+class BoundaryLoop:
+    """An ordered closed loop of 3D vertices forming a face boundary."""
+    vertices_3d: np.ndarray      # (N, 3) ordered 3D points
+    vertex_indices: np.ndarray   # (N,) indices into full mesh vertices
+    uv: Optional[np.ndarray]     # (N, 2) parametric coordinates on surface, or None
+    is_outer: bool               # True for outer perimeter, False for holes
+    n_vertices: int = 0
+
+    def __post_init__(self):
+        self.n_vertices = len(self.vertices_3d)
+
+    def to_dict(self):
+        return {
+            "vertices_3d": self.vertices_3d.tolist() if isinstance(self.vertices_3d, np.ndarray) else self.vertices_3d,
+            "uv": self.uv.tolist() if self.uv is not None and isinstance(self.uv, np.ndarray) else self.uv,
+            "is_outer": self.is_outer,
+            "n_vertices": self.n_vertices,
+        }
+
+
+@dataclass
+class TrimmedFace:
+    """A bounded region on an analytic surface, defined by boundary loops."""
+    region_id: int
+    surface_type: str            # "plane" | "cylinder" | "cone"
+    surface_params: dict         # canonical surface parameters
+    outer_loop: BoundaryLoop     # the outer boundary
+    inner_loops: List[BoundaryLoop] = field(default_factory=list)
+    area: float = 0.0
+    n_mesh_faces: int = 0
+
+    def to_dict(self):
+        return {
+            "region_id": self.region_id,
+            "surface_type": self.surface_type,
+            "outer_loop": self.outer_loop.to_dict(),
+            "inner_loops": [l.to_dict() for l in self.inner_loops],
+            "area": self.area,
+            "n_mesh_faces": self.n_mesh_faces,
+            "n_boundary_vertices": self.outer_loop.n_vertices + sum(l.n_vertices for l in self.inner_loops),
+        }
+
+
+@dataclass
 class ReconstructionState:
     """Top-level intent reconstruction state.
 
@@ -269,6 +313,8 @@ class ReconstructionState:
     proxy_edge_confidence: Optional[np.ndarray] = None    # (E,) float in [0,1]
     proxy_edge_endpoints: Optional[np.ndarray] = None     # (E, 2, 3) float
     full_face_region: Optional[np.ndarray] = None         # (F_full,) int region id (-1 = unassigned)
+    snap_result: Optional[object] = None                   # SnapResult from snap.py (set by Phase E1)
+    trimmed_faces: Dict[int, "TrimmedFace"] = field(default_factory=dict)
     metrics: Dict = field(default_factory=dict)
 
     def summary(self) -> dict:
@@ -330,7 +376,7 @@ class ReconstructionState:
             elif r.fit.type == PrimitiveType.CONE:
                 cone_families.add(r.surface_family_id)
 
-        return {
+        out = {
             "n_regions": len(self.regions),
             "n_boundaries": len(self.boundaries),
             "n_high_plane_fits": int(n_high_plane),
@@ -347,6 +393,18 @@ class ReconstructionState:
             "proxy": self.proxy.summary(),
             **self.metrics,
         }
+        if self.snap_result is not None:
+            out["snap"] = self.snap_result.stats
+        if self.trimmed_faces:
+            out["trim"] = {
+                "n_trimmed_faces": len(self.trimmed_faces),
+                "n_with_holes": sum(1 for tf in self.trimmed_faces.values() if tf.inner_loops),
+                "total_boundary_vertices": sum(
+                    tf.outer_loop.n_vertices + sum(l.n_vertices for l in tf.inner_loops)
+                    for tf in self.trimmed_faces.values()
+                ),
+            }
+        return out
 
     def to_dict(self, include_regions: bool = True) -> dict:
         out = {

@@ -70,10 +70,10 @@ CYL_MAX_RADIUS_REL = 8.0      # 8x bbox is the unfit-flat-as-cylinder failure mo
 # Cone acceptance gates. Slightly looser than cylinder because the
 # residual depends on two regressed scalars (tan α, z_apex) rather than
 # one radius, so the per-point residual has more degrees of freedom.
-CONE_HIGH_RMSE_REL = 0.012
-CONE_MED_RMSE_REL = 0.030
-CONE_HIGH_INLIER = 0.75
-CONE_MED_INLIER = 0.55
+CONE_HIGH_RMSE_REL = 0.006
+CONE_MED_RMSE_REL = 0.015
+CONE_HIGH_INLIER = 0.82
+CONE_MED_INLIER = 0.60
 # Noise-tolerant cone HIGH gate — same reasoning as PLANE_NOISY_*.
 # Cone inlier threshold is looser (0.70 vs 0.82 for planes) because:
 #   1. Cone residuals (perpendicular to cone surface) are more sensitive
@@ -83,8 +83,8 @@ CONE_MED_INLIER = 0.55
 #   3. 70% of points within 1.2% of bbox on a cone surface is a strong
 #      positive signal — a freeform surface at rmse_rel=0.018 would have
 #      far fewer inliers within the 1.2% band
-CONE_NOISY_RMSE_REL = 0.018
-CONE_NOISY_HIGH_INLIER = 0.70
+CONE_NOISY_RMSE_REL = 0.010
+CONE_NOISY_HIGH_INLIER = 0.78
 
 # Cone rejection gates. Half-angle bounds keep the cone distinguishable
 # from a cylinder (too pointy → effectively a cylinder in the limit) and

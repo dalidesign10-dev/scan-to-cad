@@ -1,176 +1,282 @@
 import React from 'react'
 import { usePipelineStore } from '../store/pipelineStore'
 
-const styles = {
+/* ── colour maps ── */
+
+const typeColors: Record<string, string> = {
+  plane: '#3b82f6',
+  cylinder: '#22c55e',
+  cone: '#f59e0b',
+  unknown: '#555',
+}
+
+const typeLabels: Record<string, string> = {
+  plane: 'Plane',
+  cylinder: 'Cylinder',
+  cone: 'Cone',
+  unknown: 'Unknown',
+}
+
+const confidenceBadge: Record<string, { bg: string; fg: string }> = {
+  HIGH:     { bg: 'rgba(34,197,94,0.15)',  fg: '#22c55e' },
+  MEDIUM:   { bg: 'rgba(245,158,11,0.15)', fg: '#f59e0b' },
+  LOW:      { bg: 'rgba(239,68,68,0.15)',  fg: '#ef4444' },
+  REJECTED: { bg: 'rgba(239,68,68,0.2)',   fg: '#ef4444' },
+}
+
+/* ── inline styles ── */
+
+const s = {
   panel: {
-    width: '240px',
-    minWidth: '240px',
-    background: '#16213e',
-    borderLeft: '1px solid #0f3460',
+    position: 'absolute' as const,
+    right: 16,
+    top: 16,
+    width: 280,
+    maxHeight: 'calc(100vh - 140px)',
     overflowY: 'auto' as const,
-    padding: '12px',
+    background: 'rgba(15,15,15,0.92)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
+    border: '1px solid #2a2a2a',
+    borderRadius: 12,
+    boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+    padding: 16,
+    zIndex: 100,
+    color: '#ccc',
   },
-  heading: {
-    fontSize: '11px',
-    fontWeight: 700,
-    textTransform: 'uppercase' as const,
-    color: '#e94560',
-    marginBottom: '12px',
-    letterSpacing: '1px',
+  header: {
+    display: 'flex' as const,
+    justifyContent: 'space-between' as const,
+    alignItems: 'center' as const,
+    marginBottom: 14,
   },
-  section: {
-    marginBottom: '16px',
+  headerTitle: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: '#f0f0f0',
+  },
+  closeBtn: {
+    background: 'none',
+    border: 'none',
+    color: '#666',
+    fontSize: 18,
+    cursor: 'pointer',
+    padding: 0,
+    lineHeight: 1,
   },
   sectionTitle: {
-    fontSize: '11px',
+    fontSize: 10,
     fontWeight: 600,
-    color: '#4ecca3',
-    marginBottom: '6px',
+    textTransform: 'uppercase' as const,
+    letterSpacing: 1.5,
+    color: '#666',
+    marginBottom: 10,
   },
-  row: {
-    display: 'flex',
+  statRow: {
+    display: 'flex' as const,
     justifyContent: 'space-between' as const,
-    fontSize: '11px',
+    alignItems: 'center' as const,
+    fontSize: 12,
     padding: '2px 0',
     color: '#ccc',
   },
   label: { color: '#888' },
-  value: { color: '#e0e0e0', fontFamily: 'monospace' },
-  patchItem: {
-    padding: '4px 8px',
-    fontSize: '11px',
-    borderRadius: '3px',
-    marginBottom: '2px',
-    cursor: 'pointer',
-    transition: 'background 0.1s',
-  },
-}
+  mono: { fontFamily: 'monospace', color: '#999' },
+  monoValue: { fontFamily: 'monospace', color: '#e0e0e0' },
+} as const
 
-const typeColors: Record<string, string> = {
-  plane: '#4ecca3',
-  planar: '#4ecca3',
-  cylinder: '#e94560',
-  cylindrical: '#e94560',
-  sphere: '#f5a623',
-  spherical: '#f5a623',
-  bspline: '#54a0ff',
-  fillet: '#f368e0',
-  curved: '#7b68ee',
-  conical: '#ff9ff3',
-  freeform: '#888',
-}
+/* ── component ── */
 
-export function FeatureInspector() {
-  const { selectedPatchId, setSelectedPatch, primitives, patches, features } = usePipelineStore()
+export function FeatureInspector({ onClose }: { onClose: () => void }) {
+  const { intentSummary, intentRegions } = usePipelineStore()
 
-  const selectedPrimitive = primitives.find((p) => p.patch_id === selectedPatchId)
-  const selectedPatch = patches.find((p) => p.id === selectedPatchId)
-  const relatedFeatures = features.filter(
-    (f) => f.patch_id === selectedPatchId || f.adjacent_patches?.includes(selectedPatchId ?? -1)
-  )
+  const hasData = intentSummary || (intentRegions && intentRegions.length > 0)
 
   return (
-    <div style={styles.panel}>
-      <div style={styles.heading}>Inspector</div>
+    <div style={s.panel} className="custom-scrollbar">
+      {/* ── Header ── */}
+      <div style={s.header}>
+        <span style={s.headerTitle}>Region Inspector</span>
+        <button
+          style={s.closeBtn}
+          onClick={onClose}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#f0f0f0' }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666' }}
+          aria-label="Close"
+        >
+          &times;
+        </button>
+      </div>
 
-      {selectedPrimitive ? (
-        <>
-          <div style={styles.section}>
-            <div style={styles.sectionTitle}>Primitive</div>
-            <div style={styles.row}>
-              <span style={styles.label}>Type</span>
-              <span style={{ ...styles.value, color: typeColors[selectedPrimitive.type] || '#fff' }}>
-                {selectedPrimitive.type}
-              </span>
-            </div>
-            <div style={styles.row}>
-              <span style={styles.label}>Inlier Ratio</span>
-              <span style={styles.value}>{(selectedPrimitive.inlier_ratio * 100).toFixed(1)}%</span>
-            </div>
-            <div style={styles.row}>
-              <span style={styles.label}>Faces</span>
-              <span style={styles.value}>{selectedPrimitive.face_count}</span>
-            </div>
-            {selectedPrimitive.radius != null && (
-              <div style={styles.row}>
-                <span style={styles.label}>Radius</span>
-                <span style={styles.value}>{selectedPrimitive.radius.toFixed(3)}</span>
-              </div>
-            )}
-            {selectedPrimitive.normal && (
-              <div style={styles.row}>
-                <span style={styles.label}>Normal</span>
-                <span style={styles.value}>
-                  [{selectedPrimitive.normal.map((v) => v.toFixed(2)).join(', ')}]
-                </span>
-              </div>
-            )}
-            {(selectedPrimitive as any).surface_class && (
-              <div style={styles.row}>
-                <span style={styles.label}>Surface</span>
-                <span style={styles.value}>{(selectedPrimitive as any).surface_class}</span>
-              </div>
-            )}
-            {(selectedPrimitive as any).rmse != null && (
-              <div style={styles.row}>
-                <span style={styles.label}>RMSE</span>
-                <span style={styles.value}>{(selectedPrimitive as any).rmse.toFixed(4)}</span>
-              </div>
-            )}
-            {selectedPrimitive.axis && (
-              <div style={styles.row}>
-                <span style={styles.label}>Axis</span>
-                <span style={styles.value}>
-                  [{selectedPrimitive.axis.map((v) => v.toFixed(2)).join(', ')}]
-                </span>
-              </div>
-            )}
-          </div>
-
-          {relatedFeatures.length > 0 && (
-            <div style={styles.section}>
-              <div style={styles.sectionTitle}>Features</div>
-              {relatedFeatures.map((f, i) => (
-                <div key={i} style={styles.row}>
-                  <span style={styles.label}>{f.type}</span>
-                  <span style={styles.value}>
-                    {f.estimated_radius ? `R=${f.estimated_radius.toFixed(2)}` : ''}
-                    {f.angle_degrees ? `${f.angle_degrees.toFixed(1)}\u00b0` : ''}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </>
-      ) : (
-        <div style={{ fontSize: '11px', color: '#666', textAlign: 'center', marginTop: '40px' }}>
-          Select a patch to inspect
+      {/* ── No data ── */}
+      {!hasData && (
+        <div style={{ fontSize: 12, color: '#555', textAlign: 'center', padding: '32px 8px' }}>
+          Run intent segmentation to inspect detected regions.
         </div>
       )}
 
-      {patches.length > 0 && (
-        <div style={styles.section}>
-          <div style={styles.sectionTitle}>Patches ({patches.length})</div>
-          <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
-            {patches.map((patch) => {
-              const prim = primitives.find((p) => p.patch_id === patch.id)
+      {/* ── Summary ── */}
+      {intentSummary && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={s.sectionTitle}>Summary</div>
+
+          {/* Total regions */}
+          <div style={s.statRow}>
+            <span style={s.label}>Total Regions</span>
+            <span style={s.monoValue}>{intentSummary.n_regions ?? '\u2014'}</span>
+          </div>
+
+          {/* Type breakdown */}
+          <div style={{ margin: '8px 0' }}>
+            {(['plane', 'cylinder', 'cone', 'unknown'] as const).map((type) => {
+              const familyKey =
+                type === 'plane' ? 'n_plane'
+                : type === 'cylinder' ? 'n_cyl'
+                : type === 'cone' ? 'n_cone'
+                : null
+              const highKey =
+                type === 'plane' ? 'high_planes'
+                : type === 'cylinder' ? 'high_cylinders'
+                : type === 'cone' ? 'high_cones'
+                : 'unknowns'
+              const count =
+                familyKey && intentSummary.families
+                  ? intentSummary.families[familyKey] ?? 0
+                  : intentSummary[highKey] ?? 0
+              if (count === 0 && type === 'unknown' && !intentSummary.unknowns) return null
               return (
                 <div
-                  key={patch.id}
-                  style={{
-                    ...styles.patchItem,
-                    background: selectedPatchId === patch.id ? '#0f3460' : 'transparent',
-                  }}
-                  onClick={() => setSelectedPatch(patch.id === selectedPatchId ? null : patch.id)}
+                  key={type}
+                  style={{ display: 'flex', alignItems: 'center', fontSize: 12, padding: '2px 0', color: '#ccc' }}
                 >
-                  <span style={{ color: typeColors[prim?.type || patch.classification] || '#888' }}>
-                    {prim?.type || patch.classification}
-                  </span>
-                  {' '}#{patch.id} ({patch.face_count} faces)
+                  <span
+                    style={{
+                      width: 10,
+                      height: 10,
+                      borderRadius: '50%',
+                      background: typeColors[type],
+                      marginRight: 8,
+                      flexShrink: 0,
+                    }}
+                  />
+                  <span style={{ flex: 1 }}>{typeLabels[type]}</span>
+                  <span style={s.monoValue}>{count}</span>
                 </div>
               )
             })}
           </div>
+
+          {/* Area explained */}
+          {intentSummary.area_explained_pct != null && (
+            <div style={s.statRow}>
+              <span style={s.label}>Area Explained</span>
+              <span style={{ fontFamily: 'monospace', color: '#22c55e', fontWeight: 600 }}>
+                {intentSummary.area_explained_pct.toFixed(1)}%
+              </span>
+            </div>
+          )}
+
+          {/* RMSE per type */}
+          {intentSummary.rmse_plane != null && (
+            <div style={s.statRow}>
+              <span style={s.label}>RMSE Plane</span>
+              <span style={s.mono}>{intentSummary.rmse_plane.toFixed(4)}</span>
+            </div>
+          )}
+          {intentSummary.rmse_cyl != null && (
+            <div style={s.statRow}>
+              <span style={s.label}>RMSE Cylinder</span>
+              <span style={s.mono}>{intentSummary.rmse_cyl.toFixed(4)}</span>
+            </div>
+          )}
+          {intentSummary.rmse_cone != null && (
+            <div style={s.statRow}>
+              <span style={s.label}>RMSE Cone</span>
+              <span style={s.mono}>{intentSummary.rmse_cone.toFixed(4)}</span>
+            </div>
+          )}
+
+          {/* Elapsed time */}
+          {intentSummary.elapsed_s != null && (
+            <div style={s.statRow}>
+              <span style={s.label}>Elapsed</span>
+              <span style={s.mono}>{intentSummary.elapsed_s.toFixed(2)}s</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Region List ── */}
+      {intentRegions && intentRegions.length > 0 && (
+        <div>
+          <div style={s.sectionTitle}>Regions ({intentRegions.length})</div>
+
+          {intentRegions.map((region) => {
+            const pType = region.primitive_type || 'unknown'
+            const color = typeColors[pType] || typeColors.unknown
+            const badge = confidenceBadge[region.confidence_class] || { bg: 'rgba(100,100,100,0.15)', fg: '#888' }
+
+            return (
+              <div
+                key={region.id}
+                style={{
+                  padding: '8px 10px',
+                  borderRadius: 6,
+                  marginBottom: 4,
+                  background: 'rgba(255,255,255,0.03)',
+                  transition: 'background 0.15s',
+                  cursor: 'default',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.06)' }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.03)' }}
+              >
+                {/* Top row: dot + ID | type | confidence pill */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                  {/* Colored dot */}
+                  <span
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: '50%',
+                      background: color,
+                      flexShrink: 0,
+                    }}
+                  />
+                  {/* Region ID */}
+                  <span style={{ fontFamily: 'monospace', color: '#666', minWidth: 20 }}>
+                    {region.id}
+                  </span>
+                  {/* Type label */}
+                  <span style={{ color, flex: 1 }}>
+                    {typeLabels[pType] || pType}
+                  </span>
+                  {/* Confidence pill */}
+                  <span
+                    style={{
+                      fontSize: 9,
+                      fontWeight: 700,
+                      padding: '2px 6px',
+                      borderRadius: 4,
+                      background: badge.bg,
+                      color: badge.fg,
+                      textTransform: 'uppercase',
+                      letterSpacing: 0.5,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {region.confidence_class || '?'}
+                  </span>
+                </div>
+
+                {/* RMSE below */}
+                {region.rmse != null && (
+                  <div style={{ fontFamily: 'monospace', color: '#666', fontSize: 10, marginTop: 4, paddingLeft: 14 }}>
+                    RMSE {region.rmse.toFixed(4)}
+                  </div>
+                )}
+              </div>
+            )
+          })}
         </div>
       )}
     </div>

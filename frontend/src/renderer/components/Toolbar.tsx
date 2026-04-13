@@ -1,44 +1,12 @@
 import React, { useRef } from 'react'
 import { usePipelineStore } from '../store/pipelineStore'
 
-const styles = {
-  toolbar: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    padding: '8px 16px',
-    background: '#16213e',
-    borderBottom: '1px solid #0f3460',
-    height: '48px',
-  },
-  title: {
-    fontSize: '14px',
-    fontWeight: 700,
-    color: '#e94560',
-    marginRight: '24px',
-  },
-  btn: {
-    padding: '6px 14px',
-    border: 'none',
-    borderRadius: '4px',
-    background: '#0f3460',
-    color: '#e0e0e0',
-    fontSize: '12px',
-    cursor: 'pointer',
-    transition: 'background 0.15s',
-  } as React.CSSProperties,
-  btnPrimary: {
-    background: '#e94560',
-    color: '#fff',
-  },
-  btnDisabled: {
-    opacity: 0.5,
-    cursor: 'not-allowed',
-  },
-}
-
-export function Toolbar({ backendReady }: { backendReady: boolean }) {
-  const { stage, loading, loadMeshFromFile, loadMeshFromPath, exportCAD, runAllPipeline, error } = usePipelineStore()
+export function Toolbar({ backendReady, showInspector, onToggleInspector }: {
+  backendReady: boolean
+  showInspector: boolean
+  onToggleInspector: () => void
+}) {
+  const { stage, loading, loadMeshFromFile, loadMeshFromPath, exportCAD, error } = usePipelineStore()
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -51,11 +19,43 @@ export function Toolbar({ backendReady }: { backendReady: boolean }) {
     loadMeshFromPath('E:/Raptor/Clio 5/Draft/clio3.stl')
   }
 
-  const canExport = stage === 'fitted' || stage === 'features_detected'
+  const canExport = stage !== 'idle'
+
+  const btnStyle: React.CSSProperties = {
+    padding: '6px 14px',
+    border: '1px solid #2a2a2a',
+    borderRadius: '6px',
+    background: '#1a1a1a',
+    color: '#f0f0f0',
+    fontSize: '12px',
+    fontWeight: 500,
+    cursor: 'pointer',
+    transition: 'all 0.15s ease',
+    whiteSpace: 'nowrap',
+  }
+
+  const btnDisabled: React.CSSProperties = {
+    opacity: 0.4,
+    cursor: 'not-allowed',
+  }
 
   return (
-    <div style={styles.toolbar}>
-      <span style={styles.title}>GEOMAGIC CLAUDE</span>
+    <div style={{
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      padding: '0 16px',
+      background: '#0f0f0f',
+      borderBottom: '1px solid #2a2a2a',
+      height: '44px',
+    }}>
+      {/* Logo */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginRight: '16px' }}>
+        <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#06b6d4' }} />
+        <span style={{ fontSize: '14px', fontWeight: 600, color: '#f0f0f0', letterSpacing: '-0.3px' }}>
+          Scan to CAD
+        </span>
+      </div>
 
       <input
         ref={fileInputRef}
@@ -66,7 +66,7 @@ export function Toolbar({ backendReady }: { backendReady: boolean }) {
       />
 
       <button
-        style={{ ...styles.btn, opacity: backendReady && !loading ? 1 : 0.5 }}
+        style={{ ...btnStyle, ...((!backendReady || loading) ? btnDisabled : {}) }}
         onClick={() => fileInputRef.current?.click()}
         disabled={!backendReady || loading}
       >
@@ -74,80 +74,84 @@ export function Toolbar({ backendReady }: { backendReady: boolean }) {
       </button>
 
       <button
-        style={{ ...styles.btn, background: '#4ecca3', color: '#111', opacity: backendReady && !loading ? 1 : 0.5 }}
+        style={{ ...btnStyle, ...((!backendReady || loading) ? btnDisabled : {}) }}
         onClick={handleLoadDemo}
         disabled={!backendReady || loading}
       >
-        Load Demo (clio3.stl)
+        Load Demo
       </button>
 
-      <button
-        style={{ ...styles.btn, background: '#f5a623', color: '#111', fontWeight: 'bold', opacity: backendReady && !loading ? 1 : 0.5 }}
-        onClick={runAllPipeline}
-        disabled={!backendReady || loading}
-        title="Load demo + run all pipeline steps + build polyhedral CAD"
-      >
-        ▶ Run All
-      </button>
+      <div style={{ width: 1, height: 20, background: '#2a2a2a', margin: '0 4px' }} />
 
       <button
-        style={{
-          ...styles.btn,
-          ...styles.btnPrimary,
-          ...(canExport && !loading ? {} : styles.btnDisabled),
-        }}
+        style={{ ...btnStyle, background: 'transparent', ...((canExport && !loading) ? {} : btnDisabled) }}
         onClick={() => exportCAD('stl')}
         disabled={!canExport || loading}
-        title="Export tessellated CAD preview as STL"
       >
         Export STL
       </button>
 
       <button
-        style={{
-          ...styles.btn,
-          ...styles.btnPrimary,
-          ...(canExport && !loading ? {} : styles.btnDisabled),
-        }}
+        style={{ ...btnStyle, background: 'transparent', ...((canExport && !loading) ? {} : btnDisabled) }}
         onClick={() => exportCAD('obj')}
         disabled={!canExport || loading}
-        title="Export tessellated CAD preview as OBJ"
       >
         Export OBJ
-      </button>
-
-      <button
-        style={{
-          ...styles.btn,
-          ...styles.btnPrimary,
-          ...(canExport && !loading ? {} : styles.btnDisabled),
-        }}
-        onClick={() => exportCAD('step')}
-        disabled={!canExport || loading}
-        title="Export true B-Rep STEP (requires pythonocc)"
-      >
-        Export STEP
       </button>
 
       <div style={{ flex: 1 }} />
 
       {error && (
-        <span style={{ fontSize: '11px', color: '#ff6b6b', maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          Error: {error}
+        <span style={{
+          fontSize: '11px',
+          color: '#ef4444',
+          background: 'rgba(239,68,68,0.1)',
+          padding: '4px 10px',
+          borderRadius: '12px',
+          maxWidth: '280px',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}>
+          {error}
         </span>
       )}
 
       {!backendReady && (
-        <span style={{ fontSize: '11px', color: '#f5a623' }}>
-          Connecting to backend...
+        <span style={{ fontSize: '11px', color: '#f59e0b', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f59e0b' }} />
+          Connecting...
         </span>
       )}
 
       {backendReady && stage !== 'idle' && (
-        <span style={{ fontSize: '11px', color: '#888' }}>
-          Stage: {stage}
+        <span style={{
+          fontSize: '10px',
+          color: '#999',
+          background: '#1a1a1a',
+          padding: '3px 8px',
+          borderRadius: '4px',
+          textTransform: 'uppercase',
+          letterSpacing: '0.5px',
+        }}>
+          {stage}
         </span>
       )}
+
+      {/* Inspector toggle */}
+      <button
+        onClick={onToggleInspector}
+        style={{
+          ...btnStyle,
+          background: showInspector ? '#242424' : 'transparent',
+          padding: '5px 8px',
+          fontSize: '14px',
+          lineHeight: 1,
+        }}
+        title={showInspector ? 'Hide inspector' : 'Show inspector'}
+      >
+        ◧
+      </button>
     </div>
   )
 }
