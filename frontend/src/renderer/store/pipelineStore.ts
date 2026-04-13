@@ -268,17 +268,44 @@ export const usePipelineStore = create<PipelineState>((set) => ({
 
   // ───────────────────────── Phase E0 ─────────────────────────
   runIntentSegmentation: async (params = {}) => {
-    set({ loading: true, error: null, progress: { stage: 'intent', pct: 5, message: 'Building proxy mesh…' } })
+    const p = { target_proxy_faces: 30000, min_region_faces: 12, ...params }
+    set({ loading: true, error: null, progress: { stage: 'intent', pct: 0, message: 'Starting E0…' } })
+
     try {
-      const res = await fetch(`${API}/intent/run`, {
+      // Start async E0 with progress polling
+      const startRes = await fetch(`${API}/intent/run_async`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target_proxy_faces: 30000, min_region_faces: 12, ...params }),
+        body: JSON.stringify(p),
       })
-      if (!res.ok) throw new Error(await res.text())
-      const result = await res.json()
-      // Pull the overlay payload separately so the tinted-mesh / gizmos
-      // path doesn't bloat the /intent/run response.
+      if (!startRes.ok) throw new Error(await startRes.text())
+
+      // Poll for progress every 500ms
+      const result = await new Promise<any>((resolve, reject) => {
+        const poll = setInterval(async () => {
+          try {
+            const res = await fetch(`${API}/intent/progress`)
+            const data = await res.json()
+            set({ progress: { stage: 'intent', pct: data.pct, message: data.message } })
+            if (data.done) {
+              clearInterval(poll)
+              if (data.error) {
+                reject(new Error(data.error))
+              } else {
+                // Fetch the full result
+                const fullRes = await fetch(`${API}/intent/state`)
+                const state = await fullRes.json()
+                resolve(state)
+              }
+            }
+          } catch (e) {
+            clearInterval(poll)
+            reject(e)
+          }
+        }, 500)
+      })
+
+      // Pull overlay data
       const ovlRes = await fetch(`${API}/intent/overlays`)
       const overlay = ovlRes.ok ? await ovlRes.json() : null
       set({
@@ -298,7 +325,7 @@ export const usePipelineStore = create<PipelineState>((set) => ({
       set({ error: e.message })
     } finally {
       set({ loading: false })
-      setTimeout(() => set({ progress: null }), 2500)
+      setTimeout(() => set({ progress: null }), 3000)
     }
   },
 

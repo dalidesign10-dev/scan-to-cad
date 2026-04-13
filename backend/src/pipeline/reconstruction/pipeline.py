@@ -77,7 +77,7 @@ def run_intent_segmentation(
 
     t0 = time.time()
     if progress_callback:
-        progress_callback("intent", 2, "Building proxy mesh...")
+        progress_callback("intent", 1, "Building proxy mesh...")
 
     proxy = build_proxy_mesh(
         full_mesh,
@@ -86,12 +86,12 @@ def run_intent_segmentation(
     )
 
     if progress_callback:
-        progress_callback("intent", 20, "Computing hybrid boundary signals...")
+        progress_callback("intent", 3, "Computing boundary signals...")
 
     signals = compute_boundary_signals(proxy, progress_callback=lambda *a, **k: None)
 
     if progress_callback:
-        progress_callback("intent", 40, "Growing regions...")
+        progress_callback("intent", 5, "Growing regions...")
 
     proxy_labels = grow_regions(
         proxy,
@@ -102,19 +102,18 @@ def run_intent_segmentation(
     )
 
     if progress_callback:
-        progress_callback("intent", 60, "Building region graph...")
+        progress_callback("intent", 8, "Building region graph...")
 
     boundaries = build_region_graph(proxy_labels, signals)
 
     if progress_callback:
-        progress_callback("intent", 65, "Transferring labels to full mesh...")
+        progress_callback("intent", 9, "Transferring labels to full mesh...")
 
     full_labels = transfer_labels_to_full(proxy_labels, proxy)
 
-    if progress_callback:
-        progress_callback("intent", 75, "Proxy fits per region...")
-
     n_regions = int(proxy_labels.max()) + 1
+    if progress_callback:
+        progress_callback("intent", 10, f"Fitting {n_regions} regions on proxy mesh...")
     full_vertices = np.asarray(full_mesh.vertices, dtype=np.float64)
     full_faces = np.asarray(full_mesh.faces, dtype=np.int64)
 
@@ -134,6 +133,9 @@ def run_intent_segmentation(
 
     regions = {}
     for r in range(n_regions):
+        if progress_callback and r % 50 == 0:
+            pct = 10 + int(25 * r / max(n_regions, 1))
+            progress_callback("intent", pct, f"Proxy fit {r}/{n_regions}...")
         proxy_face_idx = np.where(proxy_labels == r)[0].astype(np.int64)
         full_face_idx = np.where(full_labels == r)[0].astype(np.int64)
         if full_face_idx.shape[0] == 0:
@@ -162,9 +164,15 @@ def run_intent_segmentation(
         )
 
     if progress_callback:
-        progress_callback("intent", 88, "Full-resolution refit pass...")
+        progress_callback("intent", 35, f"Full-resolution refit ({len(regions)} regions)...")
 
+    refit_count = 0
+    refit_total = len(regions)
     for r in regions.values():
+        refit_count += 1
+        if progress_callback and refit_count % 20 == 0:
+            pct = 35 + int(40 * refit_count / max(refit_total, 1))
+            progress_callback("intent", pct, f"Refit {refit_count}/{refit_total} — {r.fit.type.value if r.fit else '?'}...")
         if r.excluded:
             continue
         verts_idx = np.unique(full_faces[r.full_face_indices].flatten())
@@ -187,7 +195,7 @@ def run_intent_segmentation(
         r.fit = refit
 
     if progress_callback:
-        progress_callback("intent", 93, "Splitting HIGH cores from MEDIUM regions...")
+        progress_callback("intent", 78, "Splitting HIGH cores from MEDIUM regions...")
 
     # Face adjacency is shared across core splitting and every expansion
     # round — building once saves 8+ rebuilds on large meshes.
@@ -204,7 +212,7 @@ def run_intent_segmentation(
     )
 
     if progress_callback:
-        progress_callback("intent", 96, "Expanding HIGH regions...")
+        progress_callback("intent", 85, "Expanding HIGH regions...")
 
     # Iterative expand + refit: expansion absorbs boundary faces from
     # MEDIUM into HIGH regions; refit may then promote MEDIUM regions
@@ -250,7 +258,7 @@ def run_intent_segmentation(
             break
 
     if progress_callback:
-        progress_callback("intent", 98, "Grouping HIGH fits into surface families...")
+        progress_callback("intent", 92, "Grouping HIGH fits into surface families...")
 
     _assign_surface_families(regions, mesh_bbox_diag)
     surface_families = _build_surface_families(regions)
@@ -278,7 +286,7 @@ def run_intent_segmentation(
     # boundaries and families are both populated) — that's why it runs
     # AFTER construction, not inline. Assigns to state.intent_edges.
     if progress_callback:
-        progress_callback("intent", 99, "Intersecting surface families...")
+        progress_callback("intent", 96, "Intersecting surface families...")
     from .intersect import compute_family_edges
     state.intent_edges = compute_family_edges(state, mesh_vertices=full_vertices)
     metrics["n_intent_edges"] = int(len(state.intent_edges))

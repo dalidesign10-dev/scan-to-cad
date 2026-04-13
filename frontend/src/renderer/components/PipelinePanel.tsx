@@ -87,6 +87,7 @@ export function PipelinePanel({ collapsed, onToggleCollapse }: { collapsed: bool
     runDeviationAnalysis, deviationResult, showDeviationHeatmap, toggleDeviationHeatmap,
     runConstructFaces, trimResult,
     runExportStep, stepResult, downloadStep,
+    progress,
   } = usePipelineStore()
 
   const [poissonDepth, setPoissonDepth] = useState(10)
@@ -339,8 +340,30 @@ export function PipelinePanel({ collapsed, onToggleCollapse }: { collapsed: bool
           }
           disabled={!meshInfo || loading}
         >
-          {loading ? 'Running E0...' : 'Run E0 Intent'}
+          {loading && progress?.stage === 'intent' ? 'Running E0...' : 'Run E0 Intent'}
         </button>
+        {/* Live E0 progress */}
+        {loading && progress?.stage === 'intent' && progress.pct >= 0 && (
+          <div style={{ marginTop: '8px' }}>
+            <div style={{
+              width: '100%', height: '6px', background: '#2a2a2a',
+              borderRadius: '3px', overflow: 'hidden',
+            }}>
+              <div style={{
+                width: `${progress.pct}%`, height: '100%',
+                background: 'linear-gradient(90deg, #06b6d4, #8b5cf6)',
+                borderRadius: '3px', transition: 'width 0.5s ease',
+              }} />
+            </div>
+            <div style={{
+              fontSize: '10px', color: '#999', marginTop: '4px',
+              display: 'flex', justifyContent: 'space-between',
+            }}>
+              <span>{progress.message}</span>
+              <span style={{ color: '#06b6d4', fontWeight: 600 }}>{progress.pct}%</span>
+            </div>
+          </div>
+        )}
 
         {/* Intent Summary */}
         {intentSummary && (

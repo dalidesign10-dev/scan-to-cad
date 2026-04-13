@@ -123,13 +123,7 @@ def api_cleanup_mesh(params: dict = {}):
 
 @app.post("/api/intent/run")
 def api_intent_run(params: dict = {}):
-    """Build a fresh ReconstructionState from the current cleaned mesh.
-
-    Body (all optional):
-      target_proxy_faces  int   default 30000
-      min_region_faces    int   default 12
-      growth_mode         str   "dihedral" (default) | "fit_driven"
-    """
+    """Build a fresh ReconstructionState from the current cleaned mesh."""
     try:
         from pipeline.reconstruction import run_intent_segmentation
         return run_intent_segmentation(params, progress_callback=progress_noop, session=SESSION)
@@ -138,6 +132,53 @@ def api_intent_run(params: dict = {}):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, str(e))
+
+
+# Progress state for polling-based updates
+_PROGRESS = {"stage": "", "pct": 0, "message": "", "done": False, "result": None, "error": None}
+
+
+def _progress_store(stage, pct, message=""):
+    """Progress callback that stores state for polling."""
+    _PROGRESS["stage"] = stage
+    _PROGRESS["pct"] = int(pct)
+    _PROGRESS["message"] = message
+
+
+@app.get("/api/intent/progress")
+def api_intent_progress():
+    """Poll current E0 progress."""
+    return {
+        "stage": _PROGRESS["stage"],
+        "pct": _PROGRESS["pct"],
+        "message": _PROGRESS["message"],
+        "done": _PROGRESS["done"],
+        "error": _PROGRESS["error"],
+    }
+
+
+@app.post("/api/intent/run_async")
+def api_intent_run_async(params: dict = {}):
+    """Start E0 in a background thread with pollable progress."""
+    import threading
+    from pipeline.reconstruction import run_intent_segmentation
+
+    _PROGRESS.update({"stage": "intent", "pct": 0, "message": "Starting...", "done": False, "result": None, "error": None})
+
+    def run():
+        try:
+            result = run_intent_segmentation(params, progress_callback=_progress_store, session=SESSION)
+            _PROGRESS["done"] = True
+            _PROGRESS["result"] = result
+            _PROGRESS["pct"] = 100
+            _PROGRESS["message"] = f"{result.get('summary', {}).get('n_regions', 0)} regions"
+        except Exception as e:
+            _PROGRESS["done"] = True
+            _PROGRESS["error"] = str(e)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return {"status": "started"}
 
 
 @app.get("/api/intent/state")
