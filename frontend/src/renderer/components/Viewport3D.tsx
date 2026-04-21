@@ -21,6 +21,10 @@ export function Viewport3D() {
   const mergeMap = usePipelineStore((s) => s.mergeMap)
   const point2cylResult = usePipelineStore((s) => s.point2cylResult)
   const showPoint2Cyl = usePipelineStore((s) => s.showPoint2Cyl)
+  const intentOverlay = usePipelineStore((s) => s.intentOverlay)
+  const showIntentRegionColors = usePipelineStore((s) => s.showIntentRegionColors)
+  const showIntentGizmos = usePipelineStore((s) => s.showIntentGizmos)
+  const intentColorMode = usePipelineStore((s) => s.intentColorMode)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -107,6 +111,27 @@ export function Viewport3D() {
     if (!sceneRef.current) return
     sceneRef.current.setPolyhedralCadVisible(showPolyhedralCad)
   }, [showPolyhedralCad])
+
+  // Phase E0 — push overlay payload + visibility into the scene.
+  useEffect(() => {
+    if (!sceneRef.current) return
+    sceneRef.current.setIntentOverlay(intentOverlay)
+  }, [intentOverlay])
+
+  useEffect(() => {
+    if (!sceneRef.current) return
+    sceneRef.current.setIntentRegionColors(showIntentRegionColors)
+  }, [showIntentRegionColors, intentOverlay])
+
+  useEffect(() => {
+    if (!sceneRef.current) return
+    sceneRef.current.setIntentGizmosVisible(showIntentGizmos)
+  }, [showIntentGizmos, intentOverlay])
+
+  useEffect(() => {
+    if (!sceneRef.current) return
+    sceneRef.current.setIntentColorMode(intentColorMode)
+  }, [intentColorMode, intentOverlay])
 
   // Drag and drop
   const handleDragOver = (e: React.DragEvent) => {

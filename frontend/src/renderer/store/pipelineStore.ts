@@ -76,6 +76,14 @@ interface PipelineState {
   point2cylResult: any | null
   showPoint2Cyl: boolean
 
+  // Phase E0 — mechanical intent reconstruction
+  intentSummary: any | null
+  intentRegions: any[] | null
+  intentBoundaries: any[] | null
+  intentOverlay: any | null
+  showIntentRegionColors: boolean
+  showIntentGizmos: boolean
+  intentColorMode: 'region' | 'family'
 
   setProgress: (p: { stage: string; pct: number; message: string } | null) => void
   setSelectedPatch: (id: number | null) => void
@@ -116,6 +124,12 @@ interface PipelineState {
   runAllPipeline: () => Promise<void>
   exportSTEP: () => Promise<void>
   exportCAD: (format: 'stl' | 'obj' | 'ply' | 'step') => Promise<void>
+
+  // Phase E0 actions
+  runIntentSegmentation: (params?: any) => Promise<void>
+  toggleIntentRegionColors: () => void
+  toggleIntentGizmos: () => void
+  setIntentColorMode: (mode: 'region' | 'family') => void
 }
 
 function extractFilename(transferPath: string): string {
@@ -174,6 +188,14 @@ export const usePipelineStore = create<PipelineState>((set) => ({
   future: [],
   point2cylResult: null,
   showPoint2Cyl: false,
+
+  intentSummary: null,
+  intentRegions: null,
+  intentBoundaries: null,
+  intentOverlay: null,
+  showIntentRegionColors: false,
+  showIntentGizmos: false,
+  intentColorMode: 'region',
 
   setProgress: (p) => set({ progress: p }),
   setSelectedPatch: (id) => set({ selectedPatchId: id }),
@@ -836,4 +858,44 @@ export const usePipelineStore = create<PipelineState>((set) => ({
       setTimeout(() => set({ progress: null }), 2000)
     }
   },
+
+  // ───────────────────────── Phase E0 ─────────────────────────
+  runIntentSegmentation: async (params = {}) => {
+    set({ loading: true, error: null, progress: { stage: 'intent', pct: 5, message: 'Building proxy mesh…' } })
+    try {
+      const res = await fetch(`${API}/intent/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_proxy_faces: 30000, min_region_faces: 12, ...params }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const result = await res.json()
+      // Pull the overlay payload separately so the tinted-mesh / gizmos
+      // path doesn't bloat the /intent/run response.
+      const ovlRes = await fetch(`${API}/intent/overlays`)
+      const overlay = ovlRes.ok ? await ovlRes.json() : null
+      set({
+        intentSummary: result.summary || null,
+        intentRegions: result.regions || [],
+        intentBoundaries: result.boundaries || [],
+        intentOverlay: overlay,
+        showIntentRegionColors: true,
+        showIntentGizmos: true,
+        progress: {
+          stage: 'intent',
+          pct: 100,
+          message: `${result.summary?.n_regions ?? 0} regions, ${result.summary?.n_high_plane_fits ?? 0}+${result.summary?.n_high_cylinder_fits ?? 0} high fits`,
+        },
+      })
+    } catch (e: any) {
+      set({ error: e.message })
+    } finally {
+      set({ loading: false })
+      setTimeout(() => set({ progress: null }), 2500)
+    }
+  },
+
+  toggleIntentRegionColors: () => set((s) => ({ showIntentRegionColors: !s.showIntentRegionColors })),
+  toggleIntentGizmos: () => set((s) => ({ showIntentGizmos: !s.showIntentGizmos })),
+  setIntentColorMode: (mode) => set({ intentColorMode: mode }),
 }))
